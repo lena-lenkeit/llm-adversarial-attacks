@@ -71,6 +71,8 @@ def main():
 
     # Limit dataset length
     for split in dataset:
+        dataset[split] = dataset[split].shuffle(1234, keep_in_memory=True)
+        dataset[split] = dataset[split].flatten_indices(keep_in_memory=True)
         dataset[split] = dataset[split].select(range(max_elements), keep_in_memory=True)
 
     # Print info on model, tokenizer and dataset
