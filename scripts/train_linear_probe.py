@@ -31,6 +31,13 @@ def make_imdb_sentiment_dataset(dataset_root_dir: str):
     train_dataset = datasets.Dataset.from_dict(load_split("train"))
     test_dataset = datasets.Dataset.from_dict(load_split("test"))
 
+    train_dataset = train_dataset.class_encode_column("label")
+    test_dataset = test_dataset.class_encode_column("label")
+
+    label_mapping = {"pos": 1, "neg": 0}
+    train_dataset = train_dataset.align_labels_with_mapping(label_mapping, "label")
+    test_dataset = test_dataset.align_labels_with_mapping(label_mapping, "label")
+
     dataset = datasets.DatasetDict()
     dataset["train"] = train_dataset
     dataset["test"] = test_dataset
