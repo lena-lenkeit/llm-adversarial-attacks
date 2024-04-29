@@ -68,6 +68,7 @@ def main():
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     dataset = make_imdb_sentiment_dataset(dataset_path)
+    model.eval()
 
     # Limit dataset length
     for split in dataset:
