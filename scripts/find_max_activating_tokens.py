@@ -20,24 +20,25 @@ def get_closest(input: torch.Tensor, embeddings: torch.Tensor):
     input = input  # (batch_size, num_tokens, embedding_dim)
     embeddings = embeddings  # (vocab_size, embedding_dim)
 
-    closest_embeddings = []
-    closest_distances = []
+    # Compute indices of closest tokens without gradients
     closest_idx = []
-    for token_id in range(num_tokens):
-        distances = input[None, :, token_id] - embeddings[:, None]  # (v, b, e)
-        distances = torch.linalg.vector_norm(distances, dim=-1)  # (v, b)
+    with torch.no_grad():
+        for token_id in range(num_tokens):
+            distances = input[None, :, token_id] - embeddings[:, None]  # (v, b, e)
+            distances = torch.linalg.vector_norm(distances, dim=-1)  # (v, b)
 
-        sorted_distances, sorted_idx = torch.sort(distances, dim=0, descending=False)
+            sorted_idx = torch.argsort(distances, dim=0, descending=False)
+            closest_idx.append(sorted_idx[0])
 
-        closest_distances.append(sorted_distances[0])
-        closest_embeddings.append(embeddings[sorted_idx[0]])
-        closest_idx.append(sorted_idx[0])
+    closest_idx = torch.stack(closest_idx, dim=1)
 
-    return (
-        torch.stack(closest_embeddings, dim=1),
-        torch.stack(closest_distances, dim=1),
-        torch.stack(closest_idx, dim=1),
-    )
+    # Compute closest embeddings and distances to previously identified tokens with
+    # gradients
+    closest_embeddings = embeddings[closest_idx]
+    closest_distance = input - closest_embeddings
+    closest_distance = torch.linalg.vector_norm(closest_distance, dim=-1)
+
+    return closest_embeddings, closest_distance, closest_idx
 
 
 class EmbeddingEstimator(torch.autograd.Function):
