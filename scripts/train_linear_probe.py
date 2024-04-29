@@ -51,7 +51,7 @@ def main():
     # print(scaler.mean_.shape)  # (num_features,)
 
     weight = probe.coef_ / scaler.scale_[None]  # (num_classes, num_features)
-    bias = probe.intercept_ - scaler.mean_[None] @ weight.T  # (num_classes,)
+    bias = probe.intercept_ - (scaler.mean_[None] @ weight.T)[0]  # (num_classes,)
 
     # Predict with layer
     scores_pipe = pipe.decision_function(features_test)
