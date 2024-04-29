@@ -17,18 +17,27 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 def get_closest(input: torch.Tensor, embeddings: torch.Tensor):
     num_tokens = input.shape[1]
 
-    input = input[None]  # (1, batch_size, num_tokens, embedding_dim)
-    embeddings = embeddings[:, None]  # (vocab_size, 1, embedding_dim)
+    input = input  # (batch_size, num_tokens, embedding_dim)
+    embeddings = embeddings  # (vocab_size, embedding_dim)
 
-    new = []
+    closest_embeddings = []
+    closest_distances = []
+    closest_idx = []
     for token_id in range(num_tokens):
-        distances = input[:, :, token_id] - embeddings
-        distances = torch.linalg.vector_norm(distances, dim=-1)
+        distances = input[None, :, token_id] - embeddings[:, None]  # (v, b, e)
+        distances = torch.linalg.vector_norm(distances, dim=-1)  # (v, b)
 
-        closest_idx = torch.argsort(distances, dim=0, descending=False)[0]
-        new.append(embeddings[closest_idx])
+        sorted_distances, sorted_idx = torch.sort(distances, dim=0, descending=False)
 
-    return torch.cat(new, dim=1)
+        closest_distances.append(sorted_distances[0])
+        closest_embeddings.append(embeddings[sorted_idx[0]])
+        closest_idx.append(sorted_idx[0])
+
+    return (
+        torch.stack(closest_embeddings, dim=1),
+        torch.stack(closest_distances, dim=1),
+        torch.stack(closest_idx, dim=1),
+    )
 
 
 class EmbeddingEstimator(torch.autograd.Function):
@@ -38,7 +47,7 @@ class EmbeddingEstimator(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input: torch.Tensor, embeddings: torch.Tensor):
-        return get_closest(input, embeddings)
+        return get_closest(input, embeddings)[0]
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
@@ -47,13 +56,14 @@ class EmbeddingEstimator(torch.autograd.Function):
 
 def main():
     # Parameters
+    top_k = 100000000000
     num_tokens = 4
-    layer_id = 6
+    layer_id = 18
     device = "cuda"
 
     # Directories
-    model_path = "EleutherAI/pythia-70m"
-    probe_path = "probes/pythia-70m-aclimdb"
+    model_path = "EleutherAI/pythia-410m"
+    probe_path = "probes/pythia-410m-aclimdb"
 
     # Load model, tokenizer and dataset
     model = AutoModelForCausalLM.from_pretrained(
@@ -61,6 +71,7 @@ def main():
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
+    model.to_bettertransformer()
     model.eval()
     model.requires_grad_(False)
 
@@ -74,7 +85,7 @@ def main():
     input_embedding_layer: nn.Embedding = model.get_input_embeddings()
     vocab_size, embedding_dim = input_embedding_layer.weight.shape
 
-    input_token_ids = torch.randint(vocab_size, size=(1, num_tokens))
+    input_token_ids = torch.randint(min(vocab_size, top_k), size=(1, num_tokens))
     input_token_ids = input_token_ids.to(device)
 
     input_embeddings = input_embedding_layer(input_token_ids)
@@ -83,7 +94,7 @@ def main():
     print(input_embeddings.shape)
 
     closest_embeddings = EmbeddingEstimator.apply(
-        input_embeddings, input_embedding_layer.weight
+        input_embeddings, input_embedding_layer.weight[:top_k]
     )
 
     print(input_embeddings)
@@ -107,7 +118,7 @@ def main():
     pbar = trange(128)
     for i in pbar:
         closest_embeddings = EmbeddingEstimator.apply(
-            input_embeddings, input_embedding_layer.weight
+            input_embeddings, input_embedding_layer.weight[:top_k]
         )
 
         # closest_embeddings = input_embeddings
@@ -119,12 +130,39 @@ def main():
         features = outputs.hidden_states[layer_id][:, -1]
         logits = probe(features)
 
-        loss = F.binary_cross_entropy_with_logits(logits, target_label)
+        probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
+        reg_loss = torch.mean(
+            get_closest(input_embeddings, input_embedding_layer.weight[:top_k])[1]
+        )
+
+        loss = probe_loss + reg_loss
+
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
-        pbar.set_postfix_str(f"Loss: {loss:.2e}")
+        pbar.set_postfix_str(
+            f"Loss: {loss:.2e} Probe: {probe_loss:.2e} Reg: {reg_loss:.2e}"
+        )
+
+    max_token_ids = get_closest(input_embeddings, input_embedding_layer.weight[:top_k])[
+        2
+    ]
+
+    print(max_token_ids)
+    print(tokenizer.decode(max_token_ids[0]))
+
+    # Validate
+    with torch.no_grad():
+        outputs: CausalLMOutputWithPast = model(
+            input_ids=max_token_ids, output_hidden_states=True
+        )
+
+        features = outputs.hidden_states[layer_id][:, -1]
+        logits = probe(features)
+
+        probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
+        print(probe_loss)
 
 
 if __name__ == "__main__":
