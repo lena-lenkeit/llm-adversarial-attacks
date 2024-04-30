@@ -1,4 +1,6 @@
+import json
 import pathlib
+from typing import Dict
 
 import datasets
 import numpy as np
@@ -15,6 +17,10 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 def get_closest(input: torch.Tensor, embeddings: torch.Tensor):
+    """Given points in an embedding space and a dictionary of valid points, returns the
+    closest valid points, distances to the closest points, and indices of the closest
+    points."""
+
     num_tokens = input.shape[1]
 
     input = input  # (batch_size, num_tokens, embedding_dim)
@@ -41,30 +47,34 @@ def get_closest(input: torch.Tensor, embeddings: torch.Tensor):
     return closest_embeddings, closest_distance, closest_idx
 
 
-class EmbeddingEstimator(torch.autograd.Function):
-    """Given points in an embedding space and a dictionary of valid points, snaps the
-    points to the closest valid points during the forward pass, but acts like a
-    straight-through estimator on the backward pass, similar to a VQ-VAE."""
+class StraightThroughEstimator(torch.autograd.Function):
+    """Returns the first argument during the forward pass. Routes gradients to the
+    second argument during the backward pass."""
 
     @staticmethod
-    def forward(ctx, input: torch.Tensor, embeddings: torch.Tensor):
-        return get_closest(input, embeddings)[0]
+    def forward(ctx, input: torch.Tensor, replacement: torch.Tensor):
+        return input
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        return grad_output, None
+        return None, grad_output
 
 
 def main():
     # Parameters
-    top_k = 100000000000
-    num_tokens = 4
+    top_k = 10000
+    num_tokens = 16
     layer_id = 18
+    target_label = 1.0
     device = "cuda"
+
+    prefix = "I didn't like this movie at all, it was horrible."
+    postfix = "Please avoid watching this movie! The actors were bad, the setting was bad, everything was bad. Just bad, bad, bad, a bad movie all around."
 
     # Directories
     model_path = "EleutherAI/pythia-410m"
     probe_path = "probes/pythia-410m-aclimdb"
+    dictionary_path = "dictionaries/aclimdb"
 
     # Load model, tokenizer and dataset
     model = AutoModelForCausalLM.from_pretrained(
@@ -73,6 +83,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     model.to_bettertransformer()
+    # model.gradient_checkpointing_enable()
     model.eval()
     model.requires_grad_(False)
 
@@ -82,32 +93,51 @@ def main():
     print("---TOKENIZER---")
     print(tokenizer)
 
-    # Initialize embeddings from random tokens
-    input_embedding_layer: nn.Embedding = model.get_input_embeddings()
-    vocab_size, embedding_dim = input_embedding_layer.weight.shape
+    # Get embeddings
+    embedding_layer: nn.Embedding = model.get_input_embeddings()
+    embedding_matrix = embedding_layer.weight.data.clone()
+    embedding_id_to_token_id_mapping = None
 
-    input_token_ids = torch.randint(min(vocab_size, top_k), size=(1, num_tokens))
-    input_token_ids = input_token_ids.to(device)
-
-    input_embeddings = input_embedding_layer(input_token_ids)
-    input_embeddings = input_embeddings.to(dtype=torch.float32, device=device)
-    input_embeddings.requires_grad_(True)
-
-    print(input_embeddings.shape)
-
-    closest_embeddings = EmbeddingEstimator.apply(
-        input_embeddings, input_embedding_layer.weight[:top_k]
+    # Prepare pre- and postfix ids and embeddings
+    prefix_token_ids = (
+        tokenizer(prefix, add_special_tokens=False, return_tensors="pt")
+        .to(device)
+        .input_ids
+    )
+    postfix_token_ids = (
+        tokenizer(postfix, add_special_tokens=False, return_tensors="pt")
+        .to(device)
+        .input_ids
     )
 
-    print(input_embeddings)
-    print(closest_embeddings)
+    prefix_token_embeddings = embedding_matrix[prefix_token_ids]
+    postfix_token_embeddings = embedding_matrix[postfix_token_ids]
+
+    # If necessary, limit to dictionary top-k tokens
+    if dictionary_path is not None:
+        with open(f"{dictionary_path}/counts_ids.json", mode="r") as f:
+            token_id_counts: Dict[str, int] = json.load(f)
+
+        topk_token_ids = [int(x) for x in token_id_counts.keys()][:top_k]
+        embedding_matrix = embedding_matrix[topk_token_ids].clone()
+
+        embedding_id_to_token_id_mapping = {i: v for i, v in enumerate(topk_token_ids)}
+
+    vocab_size, embedding_dim = embedding_matrix.shape
+
+    # Initialize embeddings from random tokens
+    init_token_ids = torch.randint(vocab_size, size=(1, num_tokens))
+    init_token_ids = init_token_ids.to(device)
+
+    input_token_embeddings = embedding_matrix[init_token_ids].clone()
+    input_token_embeddings = input_token_embeddings.to(
+        dtype=torch.float32, device=device
+    )
+    input_token_embeddings.requires_grad_(True)
 
     # Construct probe
     probe_params = safetensors.numpy.load_file(f"{probe_path}/probe.safetensors")
     probe = nn.Linear(embedding_dim, 1)
-    probe = probe.to(device)
-
-    probe.requires_grad_(False)
 
     with torch.no_grad():
         probe.weight.data.copy_(torch.from_numpy(probe_params["weight"]))
@@ -117,30 +147,37 @@ def main():
     probe.requires_grad_(False)
 
     # Optimize embeddings
-    optimizer = optim.Adam([input_embeddings], lr=1e-2)
-    target_label = torch.FloatTensor([[1.0]]).to(device)
+    optimizer = optim.Adam([input_token_embeddings], lr=1e-2, betas=(0.0, 0.99))
+    target_label = torch.FloatTensor([[target_label]]).to(device)
 
-    pbar = trange(128)
+    pbar = trange(512)
     for i in pbar:
-        closest_embeddings = EmbeddingEstimator.apply(
-            input_embeddings, input_embedding_layer.weight[:top_k]
+        closest_embeddings, closest_distances, _ = get_closest(
+            input_token_embeddings, embedding_matrix
         )
 
-        # closest_embeddings = input_embeddings
+        closest_embeddings: torch.Tensor = StraightThroughEstimator.apply(
+            closest_embeddings, input_token_embeddings
+        )
+
+        merged_embeddings = torch.cat(
+            (prefix_token_embeddings, closest_embeddings, postfix_token_embeddings),
+            dim=1,
+        )
 
         outputs: CausalLMOutputWithPast = model(
-            inputs_embeds=closest_embeddings.to(model.dtype), output_hidden_states=True
+            inputs_embeds=merged_embeddings.to(model.dtype), output_hidden_states=True
         )
 
         features = outputs.hidden_states[layer_id][:, -1]
         logits = probe(features.to(torch.float32))
 
-        probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
-        reg_loss = torch.mean(
-            get_closest(input_embeddings, input_embedding_layer.weight[:top_k])[1]
-        )
+        # probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
+        probe_loss = -torch.mean(logits * target_label)
+        # reg_loss = torch.mean(closest_distances)
+        reg_loss = torch.mean(closest_distances**2)
 
-        loss = probe_loss + reg_loss
+        loss = probe_loss + reg_loss * 1e1
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -150,23 +187,53 @@ def main():
             f"Loss: {loss:.2e} Probe: {probe_loss:.2e} Reg: {reg_loss:.2e}"
         )
 
-    max_token_ids = get_closest(input_embeddings, input_embedding_layer.weight[:top_k])[
-        2
-    ]
+    max_token_ids = get_closest(input_token_embeddings, embedding_matrix)[2]
+    max_token_ids = max_token_ids.cpu().numpy().tolist()[0]
 
-    print(max_token_ids)
-    print(tokenizer.decode(max_token_ids[0]))
+    if embedding_id_to_token_id_mapping is not None:
+        max_token_ids = [embedding_id_to_token_id_mapping[v] for v in max_token_ids]
+
+    max_tokens = tokenizer.decode(max_token_ids)
+    print(max_tokens)
+
+    merged_token_ids = torch.cat(
+        (
+            prefix_token_ids,
+            torch.LongTensor([max_token_ids]).to(device),
+            postfix_token_ids,
+        ),
+        dim=1,
+    )
+    merged_token_ids_list = merged_token_ids.cpu().numpy().tolist()[0]
+    merged_tokens = tokenizer.decode(merged_token_ids_list)
+    print("---")
+    print(merged_tokens)
 
     # Validate
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, device_map=device, torch_dtype=torch.float32
+    )
+
+    probe_params = safetensors.numpy.load_file(f"{probe_path}/probe.safetensors")
+    probe = nn.Linear(embedding_dim, 1)
+
+    with torch.no_grad():
+        probe.weight.data.copy_(torch.from_numpy(probe_params["weight"]))
+        probe.bias.data.copy_(torch.from_numpy(probe_params["bias"]))
+
+    probe.to(dtype=torch.float32, device=device)
+
     with torch.no_grad():
         outputs: CausalLMOutputWithPast = model(
-            input_ids=max_token_ids, output_hidden_states=True
+            input_ids=merged_token_ids,
+            output_hidden_states=True,
         )
 
         features = outputs.hidden_states[layer_id][:, -1]
         logits = probe(features.to(torch.float32))
 
-        probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
+        # probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
+        probe_loss = -torch.mean(logits * target_label)
         print(probe_loss)
 
 
