@@ -90,6 +90,7 @@ def main():
     input_token_ids = input_token_ids.to(device)
 
     input_embeddings = input_embedding_layer(input_token_ids)
+    input_embeddings = input_embeddings.to(dtype=torch.float32, device=device)
     input_embeddings.requires_grad_(True)
 
     print(input_embeddings.shape)
@@ -112,6 +113,9 @@ def main():
         probe.weight.data.copy_(torch.from_numpy(probe_params["weight"]))
         probe.bias.data.copy_(torch.from_numpy(probe_params["bias"]))
 
+    probe.to(dtype=torch.float32, device=device)
+    probe.requires_grad_(False)
+
     # Optimize embeddings
     optimizer = optim.Adam([input_embeddings], lr=1e-2)
     target_label = torch.FloatTensor([[1.0]]).to(device)
@@ -125,11 +129,11 @@ def main():
         # closest_embeddings = input_embeddings
 
         outputs: CausalLMOutputWithPast = model(
-            inputs_embeds=closest_embeddings, output_hidden_states=True
+            inputs_embeds=closest_embeddings.to(model.dtype), output_hidden_states=True
         )
 
         features = outputs.hidden_states[layer_id][:, -1]
-        logits = probe(features)
+        logits = probe(features.to(torch.float32))
 
         probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
         reg_loss = torch.mean(
@@ -160,7 +164,7 @@ def main():
         )
 
         features = outputs.hidden_states[layer_id][:, -1]
-        logits = probe(features)
+        logits = probe(features.to(torch.float32))
 
         probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
         print(probe_loss)
