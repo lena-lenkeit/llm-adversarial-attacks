@@ -105,7 +105,7 @@ def main():
 
             for cache_id, hidden_state in enumerate(outputs.hidden_states):
                 cache = activation_cache.get(cache_id, [])
-                cache.append(hidden_state[0, -1].cpu().numpy())
+                cache.append(hidden_state[0, -1].to(torch.float32).cpu().numpy())
                 activation_cache[cache_id] = cache
 
         for cache_id in activation_cache:
