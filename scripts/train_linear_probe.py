@@ -39,7 +39,7 @@ def main():
 
     # Train probe
     scaler = StandardScaler()
-    probe = LogisticRegression()
+    probe = LogisticRegression(max_iter=100000)
     pipe = make_pipeline(scaler, probe)
 
     pipe = pipe.fit(features_train, labels_train)
