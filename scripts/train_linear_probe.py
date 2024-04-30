@@ -12,11 +12,11 @@ from sklearn.preprocessing import StandardScaler
 
 
 def prepare_data(dataset: datasets.Dataset, layer_id: int):
-    features = [row[f"hidden_{layer_id}"] for row in dataset]
-    labels = [row[f"label"] for row in dataset]
+    dataset = dataset.select_columns([f"hidden_{layer_id}", "label"])
+    dataset_dict = dataset.to_dict()
 
-    features = np.stack(features, axis=0)
-    labels = np.stack(labels, axis=0)
+    features = np.stack(dataset_dict[f"hidden_{layer_id}"], axis=0)
+    labels = np.stack(dataset_dict["label"], axis=0)
 
     return features, labels
 
