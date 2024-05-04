@@ -70,8 +70,8 @@ def main():
     target_label = 1.0
     device = "cuda"
 
-    prefix = "I didn't like this movie at all, it was horrible."
-    postfix = "Please avoid watching this movie! The actors were bad, the setting was bad, everything was bad. Just bad, bad, bad, a bad movie all around."
+
+    target_text = "Hello, how are you?"
 
     # Directories
     model_path = "EleutherAI/pythia-410m"
