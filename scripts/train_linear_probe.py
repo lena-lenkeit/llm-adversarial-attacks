@@ -54,16 +54,26 @@ def main():
     bias = probe.intercept_ - (scaler.mean_[None] @ weight.T)[0]  # (num_classes,)
 
     # Predict with layer
-    scores_pipe = pipe.decision_function(features_test)
-    scores_linear = features_test @ weight.T + bias
+    scores_pipe_train = pipe.decision_function(features_train)
+    scores_linear_train = features_train @ weight.T + bias
 
-    assert np.isclose(scores_pipe[:, None], scores_linear).all()
+    scores_pipe_test = pipe.decision_function(features_test)
+    scores_linear_test = features_test @ weight.T + bias
+
+    assert np.isclose(scores_pipe_train[:, None], scores_linear_train).all()
+    assert np.isclose(scores_pipe_test[:, None], scores_linear_test).all()
 
     # Test probe
-    roc_auc = roc_auc_score(labels_test, scores_linear)
-    display = RocCurveDisplay.from_predictions(labels_test, scores_linear)
-    plt.savefig(f"{probe_path}/roc.png", bbox_inches="tight")
-    plt.savefig(f"{probe_path}/roc.svg", bbox_inches="tight")
+    roc_auc_train = roc_auc_score(labels_train, scores_linear_train)
+    RocCurveDisplay.from_predictions(labels_test, scores_linear_test)
+    plt.savefig(f"{probe_path}/roc_train.png", bbox_inches="tight")
+    plt.savefig(f"{probe_path}/roc_train.svg", bbox_inches="tight")
+    plt.close()
+
+    roc_auc_test = roc_auc_score(labels_test, scores_linear_test)
+    RocCurveDisplay.from_predictions(labels_test, scores_linear_test)
+    plt.savefig(f"{probe_path}/roc_test.png", bbox_inches="tight")
+    plt.savefig(f"{probe_path}/roc_test.svg", bbox_inches="tight")
     plt.close()
 
     # Save probe
@@ -73,7 +83,8 @@ def main():
         metadata={
             "activation_path": activation_path,
             "layer_id": str(layer_id),
-            "roc_auc": f"{roc_auc:.2f}",
+            "roc_auc_train": f"{roc_auc_train:.4f}",
+            "roc_auc_test": f"{roc_auc_test:.4f}",
         },
     )
 
