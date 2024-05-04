@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from einops import einsum, rearrange
 from tqdm.auto import tqdm as tq
 from tqdm.auto import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -16,33 +17,19 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 def get_closest(input: torch.Tensor, embeddings: torch.Tensor):
     """Given points in an embedding space and a dictionary of valid points, returns the
-    closest valid points, distances to the closest points, and indices of the closest
-    points."""
+    closest valid points, squared distances to the closest points, and indices of the
+    closest points."""
 
-    num_tokens = input.shape[1]
+    sq_dist = (
+        rearrange(einsum(input**2, "... dim -> ..."), "... seq -> ... seq 1")
+        + rearrange(einsum(embeddings**2, "... dim -> ..."), "vocab -> 1 vocab")
+        - 2 * einsum(input, embeddings, "... seq dim, vocab dim -> ... seq vocab")
+    )
 
-    input = input  # (batch_size, num_tokens, embedding_dim)
-    embeddings = embeddings  # (vocab_size, embedding_dim)
-
-    # Compute indices of closest tokens without gradients
-    closest_idx = []
-    with torch.no_grad():
-        for token_id in range(num_tokens):
-            distances = input[None, :, token_id] - embeddings[:, None]  # (v, b, e)
-            distances = torch.linalg.vector_norm(distances, dim=-1)  # (v, b)
-
-            sorted_idx = torch.argsort(distances, dim=0, descending=False)
-            closest_idx.append(sorted_idx[0])
-
-    closest_idx = torch.stack(closest_idx, dim=1)
-
-    # Compute closest embeddings and distances to previously identified tokens with
-    # gradients
+    closest_sq_distances, closest_idx = torch.min(sq_dist, dim=-1)
     closest_embeddings = embeddings[closest_idx]
-    closest_distance = input - closest_embeddings
-    closest_distance = torch.linalg.vector_norm(closest_distance, dim=-1)
 
-    return closest_embeddings, closest_distance, closest_idx
+    return closest_embeddings, closest_sq_distances, closest_idx
 
 
 class StraightThroughEstimator(torch.autograd.Function):
@@ -171,7 +158,7 @@ def main():
     pbar = trange(4096)
     for i in pbar:
         # Quantize embeddings to dictionary
-        closest_embeddings, closest_distances, _ = get_closest(
+        closest_embeddings, closest_sq_distances, _ = get_closest(
             input_token_embeddings, embedding_matrix
         )
 
@@ -197,8 +184,8 @@ def main():
         )
 
         # Calculate losses
-        reg_loss = torch.mean(closest_distances**2)
-        # reg_loss = torch.mean(closest_distances)
+        # reg_loss = 0.0
+        reg_loss = torch.mean(closest_sq_distances)
 
         probe_loss = 0.0
         if exists(probe_path):
