@@ -70,6 +70,8 @@ def main():
     target_label = 1.0
     device = "cuda"
 
+    prefix = None
+    postfix = None
 
     target_text = "Hello, how are you?"
 
@@ -166,10 +168,7 @@ def main():
     optimizer = optim.Adam([input_token_embeddings], lr=1e-3, betas=(0.0, 0.99))
 
     # Optimize embeddings
-    optimizer = optim.Adam([input_token_embeddings], lr=1e-2, betas=(0.0, 0.99))
-    target_label = torch.FloatTensor([[target_label]]).to(device)
-
-    pbar = trange(512)
+    pbar = trange(4096)
     for i in pbar:
         # Quantize embeddings to dictionary
         closest_embeddings, closest_distances, _ = get_closest(
