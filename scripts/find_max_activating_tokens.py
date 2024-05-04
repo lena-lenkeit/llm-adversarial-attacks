@@ -1,8 +1,6 @@
 import json
-import pathlib
-from typing import Dict
+from typing import Any, Dict
 
-import datasets
 import numpy as np
 import safetensors
 import safetensors.numpy
@@ -60,6 +58,10 @@ class StraightThroughEstimator(torch.autograd.Function):
         return None, grad_output
 
 
+def exists(x: Any | None) -> bool:
+    return x is not None
+
+
 def main():
     # Parameters
     top_k = 10000
@@ -99,19 +101,21 @@ def main():
     embedding_id_to_token_id_mapping = None
 
     # Prepare pre- and postfix ids and embeddings
-    prefix_token_ids = (
-        tokenizer(prefix, add_special_tokens=False, return_tensors="pt")
-        .to(device)
-        .input_ids
-    )
-    postfix_token_ids = (
-        tokenizer(postfix, add_special_tokens=False, return_tensors="pt")
-        .to(device)
-        .input_ids
-    )
+    if exists(prefix):
+        prefix_token_ids = (
+            tokenizer(prefix, add_special_tokens=False, return_tensors="pt")
+            .to(device)
+            .input_ids
+        )
+        prefix_token_embeddings = embedding_matrix[prefix_token_ids]
 
-    prefix_token_embeddings = embedding_matrix[prefix_token_ids]
-    postfix_token_embeddings = embedding_matrix[postfix_token_ids]
+    if exists(postfix):
+        postfix_token_ids = (
+            tokenizer(postfix, add_special_tokens=False, return_tensors="pt")
+            .to(device)
+            .input_ids
+        )
+        postfix_token_embeddings = embedding_matrix[postfix_token_ids]
 
     # If necessary, limit to dictionary top-k tokens
     if dictionary_path is not None:
@@ -152,6 +156,7 @@ def main():
 
     pbar = trange(512)
     for i in pbar:
+        # Quantize embeddings to dictionary
         closest_embeddings, closest_distances, _ = get_closest(
             input_token_embeddings, embedding_matrix
         )
@@ -160,11 +165,15 @@ def main():
             closest_embeddings, input_token_embeddings
         )
 
-        merged_embeddings = torch.cat(
-            (prefix_token_embeddings, closest_embeddings, postfix_token_embeddings),
-            dim=1,
-        )
+        # Construct input embeddings
+        to_merge = []
+        if exists(prefix):
+            to_merge.append(prefix_token_embeddings)
+        to_merge.append(closest_embeddings)
+        if exists(postfix):
+            to_merge.append(postfix_token_embeddings)
 
+        # Get model outputs
         outputs: CausalLMOutputWithPast = model(
             inputs_embeds=merged_embeddings.to(model.dtype), output_hidden_states=True
         )
@@ -187,6 +196,7 @@ def main():
             f"Loss: {loss:.2e} Probe: {probe_loss:.2e} Reg: {reg_loss:.2e}"
         )
 
+    # Convert back to token ids and token string
     max_token_ids = get_closest(input_token_embeddings, embedding_matrix)[2]
     max_token_ids = max_token_ids.cpu().numpy().tolist()[0]
 
@@ -196,14 +206,14 @@ def main():
     max_tokens = tokenizer.decode(max_token_ids)
     print(max_tokens)
 
-    merged_token_ids = torch.cat(
-        (
-            prefix_token_ids,
-            torch.LongTensor([max_token_ids]).to(device),
-            postfix_token_ids,
-        ),
-        dim=1,
-    )
+    to_merge = []
+    if exists(prefix):
+        to_merge.append(prefix_token_ids)
+    to_merge.append(torch.LongTensor([max_token_ids]).to(device))
+    if exists(postfix):
+        to_merge.append(postfix_token_ids)
+
+    merged_token_ids = torch.cat(to_merge, dim=1)
     merged_token_ids_list = merged_token_ids.cpu().numpy().tolist()[0]
     merged_tokens = tokenizer.decode(merged_token_ids_list)
     print("---")
