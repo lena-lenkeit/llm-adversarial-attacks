@@ -86,7 +86,9 @@ def main():
 
     # Get embeddings
     embedding_layer: nn.Embedding = model.get_input_embeddings()
-    embedding_matrix = embedding_layer.weight.data.clone()
+    embedding_matrix = embedding_layer.weight.data.clone().to(
+        dtype=torch.float32, device=device
+    )
     embedding_id_to_token_id_mapping = None
 
     # Prepare pre- and postfix ids and embeddings
@@ -132,9 +134,6 @@ def main():
     init_token_ids = init_token_ids.to(device)
 
     input_token_embeddings = embedding_matrix[init_token_ids].clone()
-    input_token_embeddings = input_token_embeddings.to(
-        dtype=torch.float32, device=device
-    )
     input_token_embeddings.requires_grad_(True)
 
     # Construct probe
