@@ -280,10 +280,11 @@ def main():
             print(probe_loss)
 
     if exists(target_text):
-        generated = model.generate(
-            **reconstructed_token_inputs, max_new_tokens=len(target_text)
-        )
-        print(tokenizer.batch_decode(generated)[0])
+        with torch.no_grad():
+            generated = model.generate(
+                **reconstructed_token_inputs, max_new_tokens=len(target_text)
+            )
+            print(tokenizer.batch_decode(generated)[0])
 
 
 if __name__ == "__main__":
