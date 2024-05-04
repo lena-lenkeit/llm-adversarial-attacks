@@ -252,6 +252,10 @@ def main():
         model_path, device_map=device, torch_dtype=torch.float32
     )
 
+    reconstructed_token_inputs = tokenizer(merged_tokens, return_tensors="pt").to(
+        device
+    )
+
     if exists(probe_path):
         # Load probe
         probe_params = safetensors.numpy.load_file(f"{probe_path}/probe.safetensors")
@@ -265,7 +269,7 @@ def main():
         # Get probe loss
         with torch.no_grad():
             outputs: CausalLMOutputWithPast = model(
-                input_ids=merged_token_ids,
+                **reconstructed_token_inputs,
                 output_hidden_states=True,
             )
 
@@ -278,7 +282,7 @@ def main():
 
     if exists(target_text):
         generated = model.generate(
-            input_ids=merged_token_ids, max_new_tokens=len(target_text)
+            **reconstructed_token_inputs, max_new_tokens=len(target_text)
         )
         print(tokenizer.batch_decode(generated)[0])
 
