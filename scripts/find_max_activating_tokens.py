@@ -117,6 +117,15 @@ def main():
         )
         postfix_token_embeddings = embedding_matrix[postfix_token_ids]
 
+    # Construct target
+    if exists(target_text):
+        target_token_ids = (
+            tokenizer(target_text, add_special_tokens=False, return_tensors="pt")
+            .to(device)
+            .input_ids
+        )
+        target_token_embeddings = embedding_matrix[target_token_ids]
+
     # If necessary, limit to dictionary top-k tokens
     if dictionary_path is not None:
         with open(f"{dictionary_path}/counts_ids.json", mode="r") as f:
@@ -140,15 +149,21 @@ def main():
     input_token_embeddings.requires_grad_(True)
 
     # Construct probe
-    probe_params = safetensors.numpy.load_file(f"{probe_path}/probe.safetensors")
-    probe = nn.Linear(embedding_dim, 1)
+    if exists(probe_path):
+        probe_params = safetensors.numpy.load_file(f"{probe_path}/probe.safetensors")
+        probe = nn.Linear(embedding_dim, 1)
 
-    with torch.no_grad():
-        probe.weight.data.copy_(torch.from_numpy(probe_params["weight"]))
-        probe.bias.data.copy_(torch.from_numpy(probe_params["bias"]))
+        with torch.no_grad():
+            probe.weight.data.copy_(torch.from_numpy(probe_params["weight"]))
+            probe.bias.data.copy_(torch.from_numpy(probe_params["bias"]))
 
-    probe.to(dtype=torch.float32, device=device)
-    probe.requires_grad_(False)
+        probe.to(dtype=torch.float32, device=device)
+        probe.requires_grad_(False)
+
+        target_label = torch.FloatTensor([[target_label]]).to(device)
+
+    # Construct optimizer
+    optimizer = optim.Adam([input_token_embeddings], lr=1e-3, betas=(0.0, 0.99))
 
     # Optimize embeddings
     optimizer = optim.Adam([input_token_embeddings], lr=1e-2, betas=(0.0, 0.99))
@@ -172,28 +187,41 @@ def main():
         to_merge.append(closest_embeddings)
         if exists(postfix):
             to_merge.append(postfix_token_embeddings)
+        if exists(target_text):
+            to_merge.append(target_token_embeddings)
+
+        merged_embeddings = torch.cat(to_merge, dim=1)
 
         # Get model outputs
         outputs: CausalLMOutputWithPast = model(
             inputs_embeds=merged_embeddings.to(model.dtype), output_hidden_states=True
         )
 
-        features = outputs.hidden_states[layer_id][:, -1]
-        logits = probe(features.to(torch.float32))
-
-        # probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
-        probe_loss = -torch.mean(logits * target_label)
-        # reg_loss = torch.mean(closest_distances)
+        # Calculate losses
         reg_loss = torch.mean(closest_distances**2)
+        # reg_loss = torch.mean(closest_distances)
 
-        loss = probe_loss + reg_loss * 1e1
+        probe_loss = 0.0
+        if exists(probe_path):
+            features = outputs.hidden_states[layer_id][:, -1]
+            logits = probe(features.to(torch.float32))
+
+            # probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
+            probe_loss = -torch.mean(logits * target_label)
+
+        target_loss = 0.0
+        if exists(target_text):
+            logits = outputs.logits[0, -target_token_ids.shape[1] - 1 : -1]
+            target_loss = F.cross_entropy(logits, target_token_ids[0])
+
+        loss = probe_loss + target_loss  # + reg_loss * 1e1
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
         pbar.set_postfix_str(
-            f"Loss: {loss:.2e} Probe: {probe_loss:.2e} Reg: {reg_loss:.2e}"
+            f"Loss: {loss:.2e} Probe: {probe_loss:.2e} Target {target_loss:.2e} Reg: {reg_loss:.2e}"
         )
 
     # Convert back to token ids and token string
@@ -224,27 +252,35 @@ def main():
         model_path, device_map=device, torch_dtype=torch.float32
     )
 
-    probe_params = safetensors.numpy.load_file(f"{probe_path}/probe.safetensors")
-    probe = nn.Linear(embedding_dim, 1)
+    if exists(probe_path):
+        # Load probe
+        probe_params = safetensors.numpy.load_file(f"{probe_path}/probe.safetensors")
+        probe = nn.Linear(embedding_dim, 1)
 
-    with torch.no_grad():
-        probe.weight.data.copy_(torch.from_numpy(probe_params["weight"]))
-        probe.bias.data.copy_(torch.from_numpy(probe_params["bias"]))
+        with torch.no_grad():
+            probe.weight.data.copy_(torch.from_numpy(probe_params["weight"]))
+            probe.bias.data.copy_(torch.from_numpy(probe_params["bias"]))
+            probe.to(dtype=torch.float32, device=device)
 
-    probe.to(dtype=torch.float32, device=device)
+        # Get probe loss
+        with torch.no_grad():
+            outputs: CausalLMOutputWithPast = model(
+                input_ids=merged_token_ids,
+                output_hidden_states=True,
+            )
 
-    with torch.no_grad():
-        outputs: CausalLMOutputWithPast = model(
-            input_ids=merged_token_ids,
-            output_hidden_states=True,
+            features = outputs.hidden_states[layer_id][:, -1]
+            logits = probe(features.to(torch.float32))
+
+            # probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
+            probe_loss = -torch.mean(logits * target_label)
+            print(probe_loss)
+
+    if exists(target_text):
+        generated = model.generate(
+            input_ids=merged_token_ids, max_new_tokens=len(target_text)
         )
-
-        features = outputs.hidden_states[layer_id][:, -1]
-        logits = probe(features.to(torch.float32))
-
-        # probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
-        probe_loss = -torch.mean(logits * target_label)
-        print(probe_loss)
+        print(tokenizer.batch_decode(generated)[0])
 
 
 if __name__ == "__main__":
