@@ -539,6 +539,13 @@ def main(args: argparse.Namespace):
         merged_tokens, add_special_tokens=False, return_tensors="pt"
     ).to(args.device)
 
+    # Check if round-trip decoding-encoding recovers the input
+    assert (
+        merged_token_ids.shape[1] == reconstructed_token_inputs.input_ids.shape[1]
+    ), f"{reconstructed_token_inputs.input_ids.shape[1]}"
+
+    assert torch.all(merged_token_ids == reconstructed_token_inputs.input_ids)
+
     if has_probe:
         # Load probe
         probe_params = safetensors.numpy.load_file(
