@@ -1,0 +1,9 @@
+- Universal and Transferable Adversarial Attacks on Aligned Language Models (https://arxiv.org/abs/2307.15043)
+  - Optimization Method: Greedy Coordinate Gradient-based Search (Gradients w.r.t. one-hot token vectors, find top-k gradient subset, find replacement token across top-k subset with the lowest loss when used as a replacement, repeat.)
+  - Find prompt suffixes for transferrable adversarial attacks
+  - Outputs are semi-garbage
+- Hard Prompts Made Easy: Gradient-Based Discrete Optimization for Prompt Tuning and Discovery (https://arxiv.org/pdf/2302.03668)
+  - Optimization Method: Continuous optimization in embedding space, projection to nearest-neighbors in the vocabulary during forward pass, gradient applied to unprojected embeddings in the backward pass.
+  - They also use a fluency loss to make the found text more interpretable.
+- Adversarial Attacks on LLMs (https://lilianweng.github.io/posts/2023-10-25-adv-attack-llm/)
+- ACL 2024 Tutorial: Vulnerabilities of Large Language Models to Adversarial Attacks (https://llm-vulnerability.github.io/)
