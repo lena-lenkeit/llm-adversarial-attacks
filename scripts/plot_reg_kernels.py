@@ -21,6 +21,10 @@ def softmin_kernel(distances, temperature: float = 1.0):
     return np.sum(softmin(distances / temperature, axis=1) * distances**2, axis=1)
 
 
+def hard_kernel(distances, dist_border: float = 1.0):
+    return np.clip(np.min(distances, axis=1) / dist_border, a_min=1.0, a_max=None) ** 2
+
+
 def main():
     rng = np.random.default_rng(1)
     dictionary_size = 16
@@ -32,7 +36,8 @@ def main():
     grid = np.stack(np.meshgrid(grid_x, grid_y), axis=2)
 
     distances = get_distances(grid.reshape(-1, 2), dictionary)
-    values = softmin_kernel(distances, temperature=1.0)
+    # values = softmin_kernel(distances, temperature=1.0)
+    values = hard_kernel(distances, dist_border=0.1)
 
     plt.figure()
     plt.scatter(*dictionary.T)
