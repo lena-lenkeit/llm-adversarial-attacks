@@ -84,6 +84,17 @@ class ConstantOrSchedule:
         return self.schedule[index]
 
 
+def safetensors_load_file_metadata(filename: str):
+    with open(filename, mode="rb") as f:
+        # Read header length (uint64)
+        header_length = int.from_bytes(f.read(8), byteorder="little", signed=False)
+
+        # Read header (utf-8 encoded json)
+        header_dict = json.loads(f.read(header_length).decode("utf-8"))
+
+    return header_dict["__metadata__"]
+
+
 def main(args: argparse.Namespace):
     # Infer values
     has_prefix = exists(args.prefix_text)
@@ -91,8 +102,7 @@ def main(args: argparse.Namespace):
     has_probe = exists(args.probe_path)
     has_target = exists(args.target_text)
     has_dictionary = exists(args.dictionary_path)
-
-    # TODO: Auto probe layer id from metadata if not supplied by user
+    probe_layer_id = args.layer_id
 
     # Load model, tokenizer and dataset
     if args.dtype == "auto":
@@ -184,6 +194,13 @@ def main(args: argparse.Namespace):
             f"{args.probe_path}/probe.safetensors"
         )
         probe = nn.Linear(embedding_dim, 1)
+
+        if not exists(probe_layer_id):
+            probe_metadata = safetensors_load_file_metadata(
+                f"{args.probe_path}/probe.safetensors"
+            )
+
+            probe_layer_id = int(probe_metadata["layer_id"])
 
         with torch.no_grad():
             probe.weight.data.copy_(torch.from_numpy(probe_params["weight"]))
@@ -346,7 +363,7 @@ def main(args: argparse.Namespace):
 
         probe_loss = 0.0
         if has_probe:
-            features = outputs.hidden_states[args.layer_id][:, -1]
+            features = outputs.hidden_states[probe_layer_id][:, -1]
             logits = probe(features.to(torch.float32))
 
             if args.probe_loss == "bce":
@@ -565,7 +582,7 @@ def main(args: argparse.Namespace):
                 output_hidden_states=True,
             )
 
-            features = outputs.hidden_states[args.layer_id][:, -1]
+            features = outputs.hidden_states[probe_layer_id][:, -1]
             logits = probe(features.to(torch.float32))
 
             if args.probe_loss == "bce":
