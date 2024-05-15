@@ -1,5 +1,8 @@
 import argparse
+import json
 import os
+from dataclasses import dataclass
+from typing import Dict
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,6 +12,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import RocCurveDisplay, roc_auc_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from tqdm.auto import tqdm as tq
 
 import datasets
 
@@ -23,25 +27,38 @@ def prepare_data(dataset: datasets.Dataset, layer_id: int):
     return features, labels
 
 
-def main(args: argparse.Namespace):
-    # Directories
-    activation_path = args.activation_path
-    probe_path = args.probe_path
+def get_num_layers(dataset: datasets.Dataset):
+    return len([name for name in dataset.column_names if name.startswith("hidden_")])
 
-    os.makedirs(probe_path, exist_ok=True)
 
-    # Load dataset
-    dataset = datasets.load_from_disk(activation_path)
+@dataclass
+class ProbeMetrics:
+    logits: np.ndarray
+    targets: np.ndarray
+    roc_auc: float
 
-    # Prepare data
-    layer_id = args.layer_id
 
+@dataclass
+class ProbeMetadata:
+    layer_id: int
+    train_metrics: ProbeMetrics
+    test_metrics: ProbeMetrics
+
+
+@dataclass
+class Probe:
+    weight: np.ndarray
+    bias: np.ndarray
+    metadata: ProbeMetadata
+
+
+def train_probe(dataset: datasets.Dataset, layer_id: int, max_iter: int):
     features_train, labels_train = prepare_data(dataset["train"], layer_id)
     features_test, labels_test = prepare_data(dataset["test"], layer_id)
 
     # Train probe
     scaler = StandardScaler()
-    probe = LogisticRegression(max_iter=args.max_iter)
+    probe = LogisticRegression(max_iter=max_iter)
     pipe = make_pipeline(scaler, probe)
 
     pipe = pipe.fit(features_train, labels_train)
@@ -57,6 +74,7 @@ def main(args: argparse.Namespace):
     scores_pipe_test = pipe.decision_function(features_test)
     scores_linear_test = features_test @ weight.T + bias
 
+    # Validate conversion
     assert np.isclose(scores_pipe_train[:, None], scores_linear_train).all()
     assert np.isclose(scores_pipe_test[:, None], scores_linear_test).all()
 
@@ -64,28 +82,84 @@ def main(args: argparse.Namespace):
     roc_auc_train = roc_auc_score(labels_train, scores_linear_train)
     roc_auc_test = roc_auc_score(labels_test, scores_linear_test)
 
-    if args.plot:
-        RocCurveDisplay.from_predictions(labels_test, scores_linear_test)
-        plt.savefig(f"{probe_path}/roc_train.png", bbox_inches="tight")
-        plt.savefig(f"{probe_path}/roc_train.svg", bbox_inches="tight")
-        plt.close()
-
-        RocCurveDisplay.from_predictions(labels_test, scores_linear_test)
-        plt.savefig(f"{probe_path}/roc_test.png", bbox_inches="tight")
-        plt.savefig(f"{probe_path}/roc_test.svg", bbox_inches="tight")
-        plt.close()
-
-    # Save probe
-    safetensors.numpy.save_file(
-        {"weight": weight, "bias": bias},
-        f"{probe_path}/probe.safetensors",
-        metadata={
-            "activation_path": activation_path,
-            "layer_id": str(layer_id),
-            "roc_auc_train": f"{roc_auc_train:.4f}",
-            "roc_auc_test": f"{roc_auc_test:.4f}",
-        },
+    return Probe(
+        weight,
+        bias,
+        metadata=ProbeMetadata(
+            layer_id,
+            train_metrics=ProbeMetrics(
+                scores_linear_train,
+                labels_train,
+                roc_auc_train,
+            ),
+            test_metrics=ProbeMetrics(
+                scores_linear_test,
+                labels_test,
+                roc_auc_test,
+            ),
+        ),
     )
+
+
+def save_probe(probe: Probe, probe_path: str, metadata: Dict[str, str] = {}):
+    data = {
+        "weight": probe.weight,
+        "bias": probe.bias,
+        "layer_id": np.int64(probe.metadata.layer_id),
+        "train_logits": probe.metadata.train_metrics.logits,
+        "train_targets": probe.metadata.train_metrics.targets,
+        "train_roc_auc": np.float64(probe.metadata.train_metrics.roc_auc),
+        "test_logits": probe.metadata.test_metrics.logits,
+        "test_targets": probe.metadata.test_metrics.targets,
+        "test_roc_auc": np.float64(probe.metadata.test_metrics.roc_auc),
+    }
+
+    os.makedirs(probe_path, exist_ok=True)
+    safetensors.numpy.save_file(
+        data, f"{probe_path}/probe.safetensors", metadata=metadata
+    )
+
+
+def main(args: argparse.Namespace):
+    # Load dataset
+    dataset = datasets.load_from_disk(args.activation_path)
+    num_layers = get_num_layers(dataset["train"])
+
+    # Train probes
+    if args.layer_id is None:
+        layer_ids = list(range(num_layers))
+    else:
+        layer_ids = args.layer_id
+
+    probes = []
+    for layer_id in tq(layer_ids):
+        probes.append(train_probe(dataset, layer_id, args.max_iter))
+
+    # Find best probe
+    best_probe = probes[0]
+    best_roc_auc = probes[0].metadata.test_metrics.roc_auc
+
+    for probe in probes[1:]:
+        probe_roc_auc = probe.metadata.test_metrics.roc_auc
+        if probe_roc_auc > best_roc_auc:
+            best_probe = probe
+            best_roc_auc = probe_roc_auc
+
+    # Save run info
+    os.makedirs(args.probe_path, exist_ok=True)
+    with open(f"{args.probe_path}/info.json", mode="w") as f:
+        info = {
+            "activation_path": args.activation_path,
+            "best_layer_id": best_probe.metadata.layer_id,
+            "best_test_roc_auc": best_roc_auc,
+        }
+
+        json.dump(info, f, indent=4)
+
+    # Save probes
+    save_probe(best_probe, f"{args.probe_path}/best")
+    for probe in probes:
+        save_probe(probe, f"{args.probe_path}/layer_{probe.metadata.layer_id}")
 
 
 if __name__ == "__main__":
@@ -93,32 +167,27 @@ if __name__ == "__main__":
     parser.add_argument(
         "--activation_path",
         type=str,
-        default="activations/pythia-160m-coherence",
+        default="activations/pythia-70m-aclimdb",
         help="Path to the activation dataset.",
     )
     parser.add_argument(
         "--probe_path",
         type=str,
-        default="probes/pythia-160m-coherence",
+        default="probes/pythia-70m-aclimdb-v2",
         help="Path to save the probe to.",
     )
     parser.add_argument(
         "--layer_id",
         type=int,
+        nargs="*",
         default=None,
-        help="Hidden layer ID to extract features from.",
+        help="Hidden layer ID(s) to extract features from.",
     )
     parser.add_argument(
         "--max_iter",
         type=int,
         default=1000000,
         help="Maximum number of iterations for the logistic regression to converge.",
-    )
-    parser.add_argument(
-        "-p",
-        "--plot",
-        action="store_true",
-        help="Set to plot ROC curves.",
     )
 
     args = parser.parse_args()
