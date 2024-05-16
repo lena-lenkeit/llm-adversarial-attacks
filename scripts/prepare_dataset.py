@@ -1,14 +1,17 @@
 import argparse
+from typing import List
 
 import torch
+from einops import rearrange
 from tqdm.auto import tqdm as tq
+from tqdm.auto import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import datasets
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def main(args: argparse.Namespace):
     # Load model, tokenizer and dataset
     if args.dtype == "auto":
@@ -28,6 +31,9 @@ def main(args: argparse.Namespace):
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     dataset = datasets.load_from_disk(args.dataset_path)
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = 0
 
     if args.to_bettertransformer:
         model = model.to_bettertransformer()
@@ -56,24 +62,41 @@ def main(args: argparse.Namespace):
     # token
     for split in dataset:
         activation_cache = {}
-        for row in tq(dataset[split]):
-            text: str = row["text"]
+        for offset in trange(0, len(dataset[split]), args.batch_size):
+            # Get batch of texts
+            rows = dataset[split][offset : offset + args.batch_size]
+            text: List[str] = rows["text"]
 
+            # Tokenize texts
             tokens = tokenizer(
-                text, max_length=args.max_length, truncation=True, return_tensors="pt"
-            )
-            tokens = tokens.to(args.device)
+                text,
+                max_length=args.max_length,
+                truncation=True,
+                padding=True,
+                return_tensors="pt",
+            ).to(args.device)
 
-            with torch.no_grad():
-                outputs: CausalLMOutputWithPast = model(
-                    **tokens, output_hidden_states=True
-                )
+            # Get last token indices
+            last_token_idx = torch.argmin(tokens.attention_mask, dim=1) - 1
+            last_token_idx = last_token_idx % tokens.attention_mask.shape[1]
+            last_token_idx = rearrange(last_token_idx, "i -> i 1 1")
 
+            # Get LM outputs
+            outputs: CausalLMOutputWithPast = model(**tokens, output_hidden_states=True)
+
+            # Save hidden layer activations to cache
             for cache_id, hidden_state in enumerate(outputs.hidden_states):
+                # Get last token activations
+                activations = torch.take_along_dim(hidden_state, last_token_idx, dim=1)
+                activations = activations[:, 0]
+                activations = activations.cpu().to(torch.float32).numpy().tolist()
+
+                # Save to cache
                 cache = activation_cache.get(cache_id, [])
-                cache.append(hidden_state[0, -1].to(torch.float32).cpu().numpy())
+                cache.extend(activations)
                 activation_cache[cache_id] = cache
 
+        # Append cache to dataset
         for cache_id in activation_cache:
             dataset[split] = dataset[split].add_column(
                 f"hidden_{cache_id}", activation_cache[cache_id]
@@ -95,6 +118,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--max_length", type=int, default=512, help="Maximum length for tokenization."
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=4, help="Batch size for encoding."
     )
     parser.add_argument(
         "--device", type=str, default="cuda", help="Device to run the model on."
