@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -39,8 +39,8 @@ class ProbeMetrics:
 
 
 @dataclass
-class ProbeMetadata:
-    layer_id: int
+class ProbeEvals:
+    eval_layer_id: int
     train_metrics: ProbeMetrics
     test_metrics: ProbeMetrics
 
@@ -49,10 +49,10 @@ class ProbeMetadata:
 class Probe:
     weight: np.ndarray
     bias: np.ndarray
-    metadata: ProbeMetadata
+    train_layer_id: int
 
 
-def train_probe(dataset: datasets.Dataset, layer_id: int, max_iter: int):
+def train_probe(dataset: datasets.DatasetDict, layer_id: int, max_iter: int):
     features_train, labels_train = prepare_data(dataset["train"], layer_id)
     features_test, labels_test = prepare_data(dataset["test"], layer_id)
 
@@ -85,19 +85,11 @@ def train_probe(dataset: datasets.Dataset, layer_id: int, max_iter: int):
     return Probe(
         weight,
         bias,
-        metadata=ProbeMetadata(
-            layer_id,
-            train_metrics=ProbeMetrics(
-                scores_linear_train,
-                labels_train,
-                roc_auc_train,
-            ),
-            test_metrics=ProbeMetrics(
-                scores_linear_test,
-                labels_test,
-                roc_auc_test,
-            ),
-        ),
+        layer_id,
+    ), ProbeEvals(
+        layer_id,
+        train_metrics=ProbeMetrics(scores_linear_train, labels_train, roc_auc_train),
+        test_metrics=ProbeMetrics(scores_linear_test, labels_test, roc_auc_test),
     )
 
 
@@ -105,18 +97,29 @@ def save_probe(probe: Probe, probe_path: str, metadata: Dict[str, str] = {}):
     data = {
         "weight": probe.weight,
         "bias": probe.bias,
-        "layer_id": np.int64(probe.metadata.layer_id),
-        "train_logits": probe.metadata.train_metrics.logits,
-        "train_targets": probe.metadata.train_metrics.targets,
-        "train_roc_auc": np.float64(probe.metadata.train_metrics.roc_auc),
-        "test_logits": probe.metadata.test_metrics.logits,
-        "test_targets": probe.metadata.test_metrics.targets,
-        "test_roc_auc": np.float64(probe.metadata.test_metrics.roc_auc),
+        "train_layer_id": np.int64(probe.train_layer_id),
     }
 
     os.makedirs(probe_path, exist_ok=True)
     safetensors.numpy.save_file(
         data, f"{probe_path}/probe.safetensors", metadata=metadata
+    )
+
+
+def save_eval(probe_eval: ProbeEvals, probe_path: str, metadata: Dict[str, str] = {}):
+    data = {
+        "layer_id": np.int64(probe_eval.eval_layer_id),
+        "train_logits": probe_eval.train_metrics.logits,
+        "train_targets": probe_eval.train_metrics.targets,
+        "train_roc_auc": np.float64(probe_eval.train_metrics.roc_auc),
+        "test_logits": probe_eval.test_metrics.logits,
+        "test_targets": probe_eval.test_metrics.targets,
+        "test_roc_auc": np.float64(probe_eval.test_metrics.roc_auc),
+    }
+
+    os.makedirs(probe_path, exist_ok=True)
+    safetensors.numpy.save_file(
+        data, f"{probe_path}/eval.safetensors", metadata=metadata
     )
 
 
@@ -131,18 +134,21 @@ def main(args: argparse.Namespace):
     else:
         layer_ids = args.layer_id
 
-    probes = []
+    probes: List[Probe] = []
+    evals: List[ProbeEvals] = []
     for layer_id in tq(layer_ids):
-        probes.append(train_probe(dataset, layer_id, args.max_iter))
+        probe, probe_eval = train_probe(dataset, layer_id, args.max_iter)
+        probes.append(probe)
+        evals.append(probe_eval)
 
     # Find best probe
-    best_probe = probes[0]
-    best_roc_auc = probes[0].metadata.test_metrics.roc_auc
+    best_id = 0
+    best_roc_auc = evals[0].test_metrics.roc_auc
 
-    for probe in probes[1:]:
-        probe_roc_auc = probe.metadata.test_metrics.roc_auc
+    for i, probe in enumerate(evals[1:], start=1):
+        probe_roc_auc = probe.test_metrics.roc_auc
         if probe_roc_auc > best_roc_auc:
-            best_probe = probe
+            best_id = i
             best_roc_auc = probe_roc_auc
 
     # Save run info
@@ -150,16 +156,19 @@ def main(args: argparse.Namespace):
     with open(f"{args.probe_path}/info.json", mode="w") as f:
         info = {
             "activation_path": args.activation_path,
-            "best_layer_id": best_probe.metadata.layer_id,
+            "best_layer_id": probes[best_id].train_layer_id,
             "best_test_roc_auc": best_roc_auc,
         }
 
         json.dump(info, f, indent=4)
 
     # Save probes
-    save_probe(best_probe, f"{args.probe_path}/best")
-    for probe in probes:
-        save_probe(probe, f"{args.probe_path}/layer_{probe.metadata.layer_id}")
+    save_probe(probes[best_id], f"{args.probe_path}/best")
+    save_eval(evals[best_id], f"{args.probe_path}/best")
+
+    for probe, probe_eval in zip(probes, evals):
+        save_probe(probe, f"{args.probe_path}/layer_{probe.train_layer_id}")
+        save_eval(probe_eval, f"{args.probe_path}/layer_{probe.train_layer_id}")
 
 
 if __name__ == "__main__":
