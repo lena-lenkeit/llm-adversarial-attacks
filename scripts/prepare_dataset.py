@@ -1,5 +1,5 @@
 import argparse
-from typing import List
+from typing import Any, Dict, List
 
 import torch
 from einops import rearrange
@@ -49,6 +49,21 @@ def main(args: argparse.Namespace):
         dataset[split] = dataset[split].flatten_indices(keep_in_memory=True)
         dataset[split] = dataset[split].select(indices, keep_in_memory=True)
 
+    # Tokenize dataset
+    def tokenize_fn(rows: Dict[str, Any]):
+        text: List[str] = rows["text"]
+        encoding = tokenizer(text, max_length=args.max_length, truncation=True)
+        token_ids = encoding.input_ids
+        num_tokens = [len(ids) for ids in token_ids]
+
+        return {"token_ids": token_ids, "num_tokens": num_tokens}
+
+    dataset = dataset.map(tokenize_fn, batched=True, keep_in_memory=True)
+
+    # Sort by input lengths to speed up batch encoding
+    dataset = dataset.sort("num_tokens", reverse=True, keep_in_memory=True)
+    dataset = dataset.flatten_indices(keep_in_memory=True)
+
     # Print info on model, tokenizer and dataset
     if args.verbose:
         print("---MODEL---")
@@ -65,14 +80,13 @@ def main(args: argparse.Namespace):
         for offset in trange(0, len(dataset[split]), args.batch_size):
             # Get batch of texts
             rows = dataset[split][offset : offset + args.batch_size]
-            text: List[str] = rows["text"]
+            token_ids: List[int] = rows["token_ids"]
 
-            # Tokenize texts
-            tokens = tokenizer(
-                text,
-                max_length=args.max_length,
-                truncation=True,
+            # Pad tokens
+            tokens = tokenizer.pad(
+                {"input_ids": token_ids},
                 padding=True,
+                return_attention_mask=True,
                 return_tensors="pt",
             ).to(args.device)
 
