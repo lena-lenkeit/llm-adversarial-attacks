@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
@@ -96,6 +97,17 @@ def safetensors_load_file_metadata(filename: str):
 
 
 def main(args: argparse.Namespace):
+    # TODO: Calculate probe loss at the correct position (before the target tokens)
+    # TODO: Make realism loss work with all methods
+    # TODO: Fix realism loss to correctly consider prefix tokens and postfix/target
+    # tokens when present
+    # TODO: Batch optimization
+    # TODO: Multi-probe, Multi-Target optimization
+    # TODO: Investigate the case where the dec-enc roundtrip fails
+    # TODO: Add special tokens for correctness, if they exist
+    # TODO: Check compatibility with dictionary feature again
+    # TODO: Check over this entire script again, clean up stuff, make sure impl. is good
+
     # Infer values
     has_prefix = exists(args.prefix_text)
     has_postfix = exists(args.postfix_text)
@@ -196,11 +208,11 @@ def main(args: argparse.Namespace):
         probe = nn.Linear(embedding_dim, 1)
 
         if not exists(probe_layer_id):
-            probe_metadata = safetensors_load_file_metadata(
+            probe_data = safetensors.numpy.load_file(
                 f"{args.probe_path}/probe.safetensors"
             )
 
-            probe_layer_id = int(probe_metadata["layer_id"])
+            probe_layer_id = int(probe_data["train_layer_id"])
 
         with torch.no_grad():
             probe.weight.data.copy_(torch.from_numpy(probe_params["weight"]))
@@ -528,11 +540,27 @@ def main(args: argparse.Namespace):
     if has_postfix:
         to_merge.append(postfix_token_ids)
 
-    merged_token_ids = torch.cat(to_merge, dim=1)
-    merged_token_ids_list = merged_token_ids.cpu().numpy().tolist()[0]
-    merged_tokens = tokenizer.decode(merged_token_ids_list)
-    print("---Merged Tokens---")
-    print(merged_tokens)
+    merged_input_token_ids = torch.cat(to_merge, dim=1)
+    merged_input_token_ids_list = merged_input_token_ids.cpu().numpy().tolist()[0]
+    merged_input_tokens = tokenizer.decode(merged_input_token_ids_list)
+
+    if has_target:
+        to_merge.append(target_token_ids)
+
+        merged_input_with_target_token_ids = torch.cat(to_merge, dim=1)
+        merged_input_with_target_token_ids_list = (
+            merged_input_with_target_token_ids.cpu().numpy().tolist()[0]
+        )
+        merged_input_with_target_tokens = tokenizer.decode(
+            merged_input_with_target_token_ids_list
+        )
+
+        print("---Merged Input + Target Tokens---")
+        print(merged_input_with_target_tokens)
+        print("-------------------")
+
+    print("---Merged Input Tokens---")
+    print(merged_input_tokens)
     print("-------------------")
 
     # Validate
@@ -553,15 +581,43 @@ def main(args: argparse.Namespace):
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 
     reconstructed_token_inputs = tokenizer(
-        merged_tokens, add_special_tokens=False, return_tensors="pt"
+        merged_input_tokens, add_special_tokens=False, return_tensors="pt"
     ).to(args.device)
 
     # Check if round-trip decoding-encoding recovers the input
     assert (
-        merged_token_ids.shape[1] == reconstructed_token_inputs.input_ids.shape[1]
-    ), f"{reconstructed_token_inputs.input_ids.shape[1]}"
+        merged_input_token_ids.shape[1] == reconstructed_token_inputs.input_ids.shape[1]
+    ), f"{merged_input_token_ids.shape[1]} | {reconstructed_token_inputs.input_ids.shape[1]}"
 
-    assert torch.all(merged_token_ids == reconstructed_token_inputs.input_ids)
+    assert torch.all(merged_input_token_ids == reconstructed_token_inputs.input_ids)
+
+    # Get logits and hidden states for input tokens
+    with torch.no_grad():
+        outputs: CausalLMOutputWithPast = model(
+            **reconstructed_token_inputs,
+            output_hidden_states=True,
+        )
+
+        # Realism loss
+        start = 0
+        if has_prefix:
+            start = prefix_token_embeddings.shape[0]
+
+        offset = closest_idx.shape[1]
+        end = start + offset
+
+        realism_log_probs = -F.cross_entropy(
+            outputs.logits[0, start : end - 1],
+            merged_input_token_ids[0, start + 1 : end],
+            reduction="none",
+        )
+
+        realism_probs = torch.exp(realism_log_probs)
+        realism_sum_log_prob = realism_log_probs.sum()
+        realism_mean_log_prob = torch.log(realism_probs.mean())
+
+        realism_sum_prob = torch.exp(realism_sum_log_prob)
+        realism_mean_prob = torch.exp(realism_mean_log_prob)
 
     if has_probe:
         # Load probe
@@ -577,11 +633,6 @@ def main(args: argparse.Namespace):
 
         # Get probe loss
         with torch.no_grad():
-            outputs: CausalLMOutputWithPast = model(
-                **reconstructed_token_inputs,
-                output_hidden_states=True,
-            )
-
             features = outputs.hidden_states[probe_layer_id][:, -1]
             logits = probe(features.to(torch.float32))
 
@@ -589,15 +640,88 @@ def main(args: argparse.Namespace):
                 probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
             if args.probe_loss == "direct":
                 probe_loss = -torch.mean(logits * target_label)
-            print(probe_loss)
+
+            print(f"Probe Loss : {probe_loss.item():.2e}")
 
     if has_target:
+        reconstructed_full_inputs = tokenizer(
+            merged_input_with_target_tokens,
+            add_special_tokens=False,
+            return_tensors="pt",
+        ).to(args.device)
+
+        # Check if round-trip decoding-encoding recovers the input
+        assert (
+            merged_input_with_target_token_ids.shape[1]
+            == reconstructed_full_inputs.input_ids.shape[1]
+        ), f"{merged_input_with_target_token_ids.shape[1]} | {reconstructed_full_inputs.input_ids.shape[1]}"
+
+        assert torch.all(
+            merged_input_with_target_token_ids == reconstructed_full_inputs.input_ids
+        )
+
         with torch.no_grad():
-            generated = model.generate(
+            # Get target loss and likelihood
+            outputs: CausalLMOutputWithPast = model(
+                **reconstructed_full_inputs,
+            )
+
+            logits = outputs.logits[0, -target_token_ids.shape[1] - 1 : -1]
+            target_log_probs = -F.cross_entropy(
+                logits, target_token_ids[0], reduction="none"
+            )
+            target_probs = torch.exp(target_log_probs)
+            target_sum_log_prob = target_log_probs.sum()
+            target_mean_log_prob = torch.log(target_probs.mean())
+
+            target_sum_prob = torch.exp(target_sum_log_prob)
+            target_mean_prob = torch.exp(target_mean_log_prob)
+
+            # Sample most likely continuation
+            model_continuation = model.generate(
                 **reconstructed_token_inputs,
                 max_new_tokens=target_token_ids.shape[1] * 4,
             )
-            print(tokenizer.batch_decode(generated)[0])
+            model_continuation_text = tokenizer.batch_decode(model_continuation)
+
+            print(f"Model Continuation: {model_continuation_text[0]}")
+
+    # Save results
+    if exists(args.output_path):
+        os.makedirs(f"{args.output_path}", exist_ok=True)
+        with open(f"{args.output_path}/adversarial_tokens.json", mode="w") as f:
+            data = {
+                "adv_token_ids": max_token_ids_list,
+                "adv_tokens": max_tokens,
+                "merged_token_ids": merged_input_token_ids_list,
+                "merged_tokens": merged_input_tokens,
+            }
+
+            data["realism_probs"] = realism_probs.cpu().numpy().tolist()
+            data["realism_log_probs"] = realism_log_probs.cpu().numpy().tolist()
+            data["realism_sum_prob"] = realism_sum_prob.item()
+            data["realism_sum_log_prob"] = realism_sum_log_prob.item()
+            data["realism_mean_prob"] = realism_mean_prob.item()
+            data["realism_mean_log_prob"] = realism_mean_log_prob.item()
+
+            if has_probe:
+                data["probe_logits"] = logits.item()
+                data["probe_targets"] = target_label.item()
+
+            if has_target:
+                data["target_probs"] = target_probs.cpu().numpy().tolist()
+                data["target_log_probs"] = target_log_probs.cpu().numpy().tolist()
+                data["target_sum_prob"] = target_sum_prob.item()
+                data["target_sum_log_prob"] = target_sum_log_prob.item()
+                data["target_mean_prob"] = target_mean_prob.item()
+                data["target_mean_log_prob"] = target_mean_log_prob.item()
+
+                data["continuation_token_ids"] = (
+                    model_continuation.cpu().numpy().tolist()[0]
+                )
+                data["continuation_tokens"] = model_continuation_text[0]
+
+            json.dump(data, f, indent=4)
 
 
 if __name__ == "__main__":
@@ -640,6 +764,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--dictionary_path", type=str, default=None, help="Path to the dictionary file"
+    )
+    parser.add_argument(
+        "--output_path", type=str, default=None, help="Path at which to store results"
     )
     parser.add_argument(
         "--dictionary_top_k",
