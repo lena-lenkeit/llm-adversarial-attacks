@@ -54,7 +54,6 @@ Some observations:
 ## To-Do
 
 - Finish converting everything over to argparse
-- Add probe eval script for datasets other than the training dataset
 - Add multi-probe and multi-target optimization support
 - Add artifact IO to all scripts
 - Run a benchmark on all datasets across all Pythia sizes
