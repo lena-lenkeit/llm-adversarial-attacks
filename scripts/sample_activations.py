@@ -41,7 +41,7 @@ def main(args: argparse.Namespace):
 
     # Limit dataset length
     for split in dataset:
-        if len(dataset[split]) <= args.max_elements:
+        if args.max_elements is None or len(dataset[split]) <= args.max_elements:
             continue
 
         indices = range(args.max_elements)
@@ -127,7 +127,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_elements",
         type=int,
-        default=4096,
+        default=None,
         help="Maximum number of elements in the dataset to process.",
     )
     parser.add_argument(
