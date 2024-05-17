@@ -76,7 +76,7 @@ def main(args: argparse.Namespace):
     # Run entire dataset through model, caching all hidden layer activations at the last
     # token
     for split in dataset:
-        activation_cache = {}
+        activation_cache = [[] for _ in range(model.config.num_hidden_layers + 1)]
         for offset in trange(0, len(dataset[split]), args.batch_size):
             # Get batch of texts
             rows = dataset[split][offset : offset + args.batch_size]
@@ -103,18 +103,22 @@ def main(args: argparse.Namespace):
                 # Get last token activations
                 activations = torch.take_along_dim(hidden_state, last_token_idx, dim=1)
                 activations = activations[:, 0]
-                activations = activations.cpu().to(torch.float32).numpy().tolist()
+                activations = activations.to(device="cpu", dtype=torch.float32)
 
                 # Save to cache
-                cache = activation_cache.get(cache_id, [])
-                cache.extend(activations)
-                activation_cache[cache_id] = cache
+                activation_cache[cache_id].append(activations)
+
+        # Finalize cache
+        cache_dict = {}
+        for cache_id, cache in enumerate(activation_cache):
+            cache_dict[f"hidden_{cache_id}"] = torch.cat(cache, dim=0).numpy()
+
+        cache_dataset = datasets.Dataset.from_dict(cache_dict)
 
         # Append cache to dataset
-        for cache_id in activation_cache:
-            dataset[split] = dataset[split].add_column(
-                f"hidden_{cache_id}", activation_cache[cache_id]
-            )
+        dataset[split] = datasets.concatenate_datasets(
+            [dataset[split], cache_dataset], axis=1
+        )
 
     # Save dataset, with activations included
     dataset.save_to_disk(args.activation_cache_path)
