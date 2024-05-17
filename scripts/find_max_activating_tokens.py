@@ -1,7 +1,7 @@
 import argparse
 import json
 import os
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Tuple
 
 import numpy as np
 import safetensors
@@ -96,8 +96,169 @@ def safetensors_load_file_metadata(filename: str):
     return header_dict["__metadata__"]
 
 
+def get_cross_entropy_metrics(logits: torch.FloatTensor, targets: torch.LongTensor):
+    cross_entropy = F.cross_entropy(logits, targets, reduction="none")
+    log_probs = -cross_entropy
+
+    probs = torch.exp(log_probs)
+    total_log_prob = log_probs.sum()
+    mean_log_prob = torch.log(probs.mean())
+
+    total_prob = torch.exp(total_log_prob)
+    mean_prob = torch.exp(mean_log_prob)
+
+    return {
+        "log_probs": log_probs,
+        "probs": probs,
+        "total_log_prob": total_log_prob,
+        "mean_log_prob": mean_log_prob,
+        "total_prob": total_prob,
+        "mean_prob": mean_prob,
+    }
+
+
+def torch_dict_to_python(torch_dict: Dict[str, torch.Tensor]):
+    return {k: v.tolist() for k, v in torch_dict.items()}
+
+
+def dict_prefix_keys(dictionary: dict, prefix: str):
+    return {prefix + k: v for k, v in dictionary.items()}
+
+
+def realism_loss_input_helper(
+    logits: torch.FloatTensor,
+    adv_token_ids: torch.LongTensor,
+    has_prefix: bool,
+    num_prefix_tokens: int,
+    num_adv_tokens: int,
+):
+    start = 0
+    offset = num_adv_tokens
+
+    if has_prefix:
+        start = num_prefix_tokens - 1
+        offset += 1
+
+    end = start + offset
+
+    adv_logits = rearrange(logits[:, start : end - 1], "b t f -> (b t) f")
+    adv_targets = rearrange(adv_token_ids[:, 1:], "b t -> (b t)")
+
+    return adv_logits, adv_targets
+
+
+def probe_loss_fn(
+    probe: nn.Module,
+    probe_layer_id: int,
+    hidden_activations: Tuple[torch.FloatTensor, ...],
+    target: torch.FloatTensor,
+    num_input_tokens: int,
+    loss_type: Literal["bce", "direct"],
+):
+    features = hidden_activations[probe_layer_id][:, num_input_tokens - 1]
+    logits = probe(features.to(torch.float32))
+
+    if loss_type == "bce":
+        probe_loss = F.binary_cross_entropy_with_logits(logits, target)
+    elif loss_type == "direct":
+        probe_loss = -torch.mean(logits * target)
+
+    return probe_loss, logits
+
+
+def target_loss_input_helper(
+    logits: torch.FloatTensor, target_token_ids: torch.LongTensor, num_input_tokens: int
+):
+    return rearrange(logits[:, num_input_tokens:], "b t f -> (b t) f"), rearrange(
+        target_token_ids, "b t -> (b t)"
+    )
+
+
+def target_loss_fn(logits: torch.FloatTensor, targets: torch.LongTensor):
+    return F.cross_entropy(logits, targets)
+
+
+def load_model_and_tokenizer(
+    model_path: str,
+    device: str,
+    dtype: str,
+    attn_implementation: str,
+    to_bettertransformer: bool | None,
+    gradient_checkpointing: bool | None,
+):
+    if dtype == "auto":
+        model_dtype = "auto"
+    else:
+        model_dtype = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }[dtype]
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map=device,
+        torch_dtype=model_dtype,
+        attn_implementation=attn_implementation,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    if to_bettertransformer:
+        model = model.to_bettertransformer()
+    if gradient_checkpointing:
+        model = model.gradient_checkpointing_enable()
+
+    model.eval()
+    model.requires_grad_(False)
+
+    return model, tokenizer
+
+
+@torch.no_grad()
+def load_probe(
+    probe_path: str, embedding_dim: int, probe_layer_id: int | None, device: str
+):
+    # Load probe data
+    probe_data = safetensors.numpy.load_file(f"{probe_path}/probe.safetensors")
+
+    # Initialize probe
+    probe = nn.Linear(embedding_dim, 1)
+    probe.weight.data.copy_(torch.from_numpy(probe_data["weight"]))
+    probe.bias.data.copy_(torch.from_numpy(probe_data["bias"]))
+
+    probe.to(dtype=torch.float32, device=device)
+    probe.requires_grad_(False)
+
+    # Load correct probe layer
+    if not exists(probe_layer_id):
+        probe_layer_id = int(probe_data["train_layer_id"])
+
+    return probe, probe_layer_id
+
+
+def mix_embeddings(mixing_factors: torch.Tensor, embedding_matrix: torch.Tensor):
+    mixed_embeddings = einsum(
+        mixing_factors,
+        embedding_matrix,
+        "... vocab, vocab features -> ... features",
+    )
+
+    return mixed_embeddings
+
+
+def check_roundtrip(input: torch.LongTensor, roundtrip: torch.LongTensor):
+    # Check shapes
+    shape_check = input.shape == roundtrip.shape
+
+    # Check contents
+    content_check = False
+    if shape_check:
+        content_check = torch.all(input == roundtrip)
+
+    return shape_check and content_check
+
+
 def main(args: argparse.Namespace):
-    # TODO: Calculate probe loss at the correct position (before the target tokens)
     # TODO: Make realism loss work with all methods
     # TODO: Fix realism loss to correctly consider prefix tokens and postfix/target
     # tokens when present
@@ -107,6 +268,13 @@ def main(args: argparse.Namespace):
     # TODO: Add special tokens for correctness, if they exist
     # TODO: Check compatibility with dictionary feature again
     # TODO: Check over this entire script again, clean up stuff, make sure impl. is good
+    # TODO: Check logit-distribution of probes on normal data as reference
+    # TODO: Think about what to do with step-optimization and token space
+
+    # NOTE: Letting it train in embedding space with lr 1e2 for a long time seems to do
+    # wonders for the realism loss. With 4096 steps and 4 1e-1 stages, I got the realism
+    # loss down to 2.79 . Maybe training even longer, without stages, a different lr would
+    # give super realistic samples.
 
     # Infer values
     has_prefix = exists(args.prefix_text)
@@ -116,31 +284,15 @@ def main(args: argparse.Namespace):
     has_dictionary = exists(args.dictionary_path)
     probe_layer_id = args.layer_id
 
-    # Load model, tokenizer and dataset
-    if args.dtype == "auto":
-        model_dtype = "auto"
-    else:
-        model_dtype = {
-            "float32": torch.float32,
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-        }[args.dtype]
-
-    model = AutoModelForCausalLM.from_pretrained(
+    # Load model and tokenizer
+    model, tokenizer = load_model_and_tokenizer(
         args.model_path,
-        device_map=args.device,
-        torch_dtype=model_dtype,
-        attn_implementation=args.attn_implementation,
+        args.device,
+        args.dtype,
+        args.attn_implementation,
+        args.to_bettertransformer,
+        args.gradient_checkpointing,
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-
-    if args.to_bettertransformer:
-        model = model.to_bettertransformer()
-    if args.gradient_checkpointing:
-        model = model.gradient_checkpointing_enable()
-
-    model.eval()
-    model.requires_grad_(False)
 
     # Print info on model, tokenizer and dataset
     if args.verbose:
@@ -169,14 +321,28 @@ def main(args: argparse.Namespace):
         return embedding_matrix[token_ids], token_ids
 
     # Prepare pre- and postfix ids and embeddings
+    num_adv_tokens = args.num_tokens
+    num_input_tokens = num_adv_tokens
+    num_prefix_tokens = None
+    num_postfix_tokens = None
+    num_target_tokens = None
+
     if has_prefix:
         prefix_token_embeddings, prefix_token_ids = embedd_text(args.prefix_text)
+        num_prefix_tokens = prefix_token_ids.shape[1]
+        num_input_tokens += num_prefix_tokens
     if has_postfix:
         postfix_token_embeddings, postfix_token_ids = embedd_text(args.postfix_text)
+        num_postfix_tokens = postfix_token_ids.shape[1]
+        num_input_tokens += num_postfix_tokens
 
     # Construct target
+    num_total_tokens = num_input_tokens
+
     if has_target:
         target_token_embeddings, target_token_ids = embedd_text(args.target_text)
+        num_target_tokens = target_token_ids.shape[1]
+        num_total_tokens += num_target_tokens
 
     # If necessary, limit to dictionary top-k tokens
     if has_dictionary:
@@ -201,26 +367,11 @@ def main(args: argparse.Namespace):
         input_token_embeddings.requires_grad_(True)
 
     # Construct probe (again in float32 to avoid precision issues)
+    probe_layer_id = args.layer_id
     if has_probe:
-        probe_params = safetensors.numpy.load_file(
-            f"{args.probe_path}/probe.safetensors"
+        probe, probe_layer_id = load_probe(
+            args.probe_path, embedding_dim, probe_layer_id, args.device
         )
-        probe = nn.Linear(embedding_dim, 1)
-
-        if not exists(probe_layer_id):
-            probe_data = safetensors.numpy.load_file(
-                f"{args.probe_path}/probe.safetensors"
-            )
-
-            probe_layer_id = int(probe_data["train_layer_id"])
-
-        with torch.no_grad():
-            probe.weight.data.copy_(torch.from_numpy(probe_params["weight"]))
-            probe.bias.data.copy_(torch.from_numpy(probe_params["bias"]))
-
-        probe.to(dtype=torch.float32, device=args.device)
-        probe.requires_grad_(False)
-
         target_label = torch.FloatTensor([[args.probe_target_label]]).to(args.device)
 
     # Construct optimizer
@@ -291,11 +442,7 @@ def main(args: argparse.Namespace):
                     token_mixing_logits * temp_schedule[i], dim=-1
                 )
 
-                soft_embeddings = einsum(
-                    token_mixing_soft,
-                    embedding_matrix,
-                    "... vocab, vocab features -> ... features",
-                )
+                soft_embeddings = mix_embeddings(token_mixing_soft, embedding_matrix)
 
                 quantized_embeddings = soft_embeddings
             elif args.method == "hard_softmax":
@@ -304,17 +451,8 @@ def main(args: argparse.Namespace):
                 )
                 token_mixing_hard = F.softmax(token_mixing_logits * 1e10, dim=-1)
 
-                soft_embeddings = einsum(
-                    token_mixing_soft,
-                    embedding_matrix,
-                    "... vocab, vocab features -> ... features",
-                )
-
-                hard_embeddings = einsum(
-                    token_mixing_hard,
-                    embedding_matrix,
-                    "... vocab, vocab features -> ... features",
-                )
+                soft_embeddings = mix_embeddings(token_mixing_soft, embedding_matrix)
+                hard_embeddings = mix_embeddings(token_mixing_hard, embedding_matrix)
 
                 quantized_embeddings = reroute_gradients(
                     hard_embeddings, soft_embeddings
@@ -325,11 +463,12 @@ def main(args: argparse.Namespace):
                     tau=tau_schedule[i],
                     hard=True,
                 )
-                quantized_embeddings = einsum(
-                    token_mixing_factors,
-                    embedding_matrix,
-                    "... vocab, vocab features -> ... features",
+
+                quantized_embeddings = mix_embeddings(
+                    token_mixing_factors, embedding_matrix
                 )
+
+            _, _, closest_idx, _ = get_closest(quantized_embeddings, embedding_matrix)
 
         # Construct input embeddings
         to_merge = []
@@ -375,32 +514,32 @@ def main(args: argparse.Namespace):
 
         probe_loss = 0.0
         if has_probe:
-            features = outputs.hidden_states[probe_layer_id][:, -1]
-            logits = probe(features.to(torch.float32))
-
-            if args.probe_loss == "bce":
-                probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
-            if args.probe_loss == "direct":
-                probe_loss = -torch.mean(logits * target_label)
+            probe_loss, _ = probe_loss_fn(
+                probe,
+                probe_layer_id,
+                outputs.hidden_states,
+                target_label,
+                num_input_tokens,
+                args.probe_loss,
+            )
 
         target_loss = 0.0
         if has_target:
-            logits = outputs.logits[0, -target_token_ids.shape[1] - 1 : -1]
-            target_loss = F.cross_entropy(logits, target_token_ids[0])
+            logits, targets = target_loss_input_helper(
+                outputs.logits, target_token_ids, num_input_tokens
+            )
+            target_loss = F.cross_entropy(logits, targets)
 
         realism_loss = 0.0
         if args.realism_loss:
-            start = 0
-            if has_prefix:
-                start = prefix_token_embeddings.shape[0]
-
-            offset = closest_idx.shape[1]
-            end = start + offset
-
-            realism_loss = F.cross_entropy(
-                outputs.logits[0, start : end - 1],
-                closest_idx[0, start + 1 : end],
+            logits, targets = realism_loss_input_helper(
+                outputs.logits,
+                closest_idx,
+                has_prefix,
+                num_prefix_tokens,
+                num_adv_tokens,
             )
+            realism_loss = F.cross_entropy(logits, targets)
 
         loss = probe_loss + target_loss + reg_loss * reg_schedule[i] + realism_loss
 
@@ -410,7 +549,7 @@ def main(args: argparse.Namespace):
             if args.space == "tokens":
                 best_token_values = token_mixing_logits.clone()
             elif args.space == "embeddings":
-                best_token_values = input_token_embeddings.clone()
+                best_token_values = closest_embeddings.clone()
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -498,228 +637,148 @@ def main(args: argparse.Namespace):
 
         # Add postfix to pbar
         postfix_dict = {
+            "lr": optimizer.param_groups[0]["lr"],
             "best_total_loss": best_loss,
             "total_loss": loss,
-            "reg_loss": reg_loss,
-            "likelihood_loss": realism_loss,
         }
+        if args.num_stages > 1:
+            postfix_dict["current_stage"] = current_stage
         if args.space == "embeddings":
             postfix_dict["mean_sq_dist"] = torch.mean(closest_sq_distances)
         if has_probe:
             postfix_dict["probe_loss"] = probe_loss
         if has_target:
             postfix_dict["target_loss"] = target_loss
+        if args.regularization_type:
+            postfix_dict["regularization_loss"] = reg_loss
+        if args.realism_loss:
+            postfix_dict["likelihood_loss"] = realism_loss
 
         postfix_str = " ".join([f"{k}: {v:.2e}" for k, v in postfix_dict.items()])
         pbar.set_postfix_str(postfix_str)
 
-    # Convert back to token ids and token string
+    # Get best token ids
     if args.space == "tokens":
         # Ids of tokens with largest logits
-        max_token_ids = torch.argmax(best_token_values, dim=2)
+        adv_token_ids = torch.argmax(best_token_values, dim=2)
     elif args.space == "embeddings":
         # Ids of closest tokens in dictionary
-        max_token_ids = get_closest(best_token_values, embedding_matrix)[2]
+        adv_token_ids = get_closest(best_token_values, embedding_matrix)[2]
 
-    max_token_ids_list = max_token_ids.cpu().numpy().tolist()[0]
-
-    if embedding_id_to_token_id_mapping is not None:
-        max_token_ids_list = [
-            embedding_id_to_token_id_mapping[v] for v in max_token_ids_list
-        ]
-
-    max_tokens = tokenizer.decode(max_token_ids_list)
-    print("---Found Tokens---")
-    print(max_tokens)
-    print("------------------")
-
+    # Reconstruct full input (including prefix and postfix)
     to_merge = []
     if has_prefix:
         to_merge.append(prefix_token_ids)
-    to_merge.append(max_token_ids)
+    to_merge.append(adv_token_ids)
     if has_postfix:
         to_merge.append(postfix_token_ids)
 
-    merged_input_token_ids = torch.cat(to_merge, dim=1)
-    merged_input_token_ids_list = merged_input_token_ids.cpu().numpy().tolist()[0]
-    merged_input_tokens = tokenizer.decode(merged_input_token_ids_list)
+    input_token_ids = torch.cat(to_merge, dim=1)
 
     if has_target:
         to_merge.append(target_token_ids)
 
-        merged_input_with_target_token_ids = torch.cat(to_merge, dim=1)
-        merged_input_with_target_token_ids_list = (
-            merged_input_with_target_token_ids.cpu().numpy().tolist()[0]
-        )
-        merged_input_with_target_tokens = tokenizer.decode(
-            merged_input_with_target_token_ids_list
-        )
+    full_token_ids = torch.cat(to_merge, dim=1)
 
-        print("---Merged Input + Target Tokens---")
-        print(merged_input_with_target_tokens)
-        print("-------------------")
+    # Decode all to strings
+    adv_tokens = tokenizer.batch_decode(adv_token_ids)
+    input_tokens = tokenizer.batch_decode(input_token_ids)
+    full_tokens = tokenizer.batch_decode(full_token_ids)
 
-    print("---Merged Input Tokens---")
-    print(merged_input_tokens)
-    print("-------------------")
-
-    # Validate
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        device_map=args.device,
-        torch_dtype=model_dtype,
-        attn_implementation=args.attn_implementation,
-    )
-    if args.to_bettertransformer:
-        model = model.to_bettertransformer()
-    if args.gradient_checkpointing:
-        model = model.gradient_checkpointing_enable()
-
-    model.eval()
-    model.requires_grad_(False)
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-
-    reconstructed_token_inputs = tokenizer(
-        merged_input_tokens, add_special_tokens=False, return_tensors="pt"
-    ).to(args.device)
+    # Re-encode for round-trip consistency check
+    roundtrip_adv_token_ids = tokenize_text(adv_tokens)
+    roundtrip_input_token_ids = tokenize_text(input_tokens)
+    roundtrip_full_token_ids = tokenize_text(full_tokens)
 
     # Check if round-trip decoding-encoding recovers the input
-    assert (
-        merged_input_token_ids.shape[1] == reconstructed_token_inputs.input_ids.shape[1]
-    ), f"{merged_input_token_ids.shape[1]} | {reconstructed_token_inputs.input_ids.shape[1]}"
+    roundtrip_adv_check = check_roundtrip(adv_token_ids, roundtrip_adv_token_ids)
+    roundtrip_input_check = check_roundtrip(input_token_ids, roundtrip_input_token_ids)
+    roundtrip_full_check = check_roundtrip(full_token_ids, roundtrip_full_token_ids)
 
-    assert torch.all(merged_input_token_ids == reconstructed_token_inputs.input_ids)
+    assert roundtrip_adv_check and roundtrip_input_check and roundtrip_full_check
 
-    # Get logits and hidden states for input tokens
+    # Reload model and tokenizer
+    model, tokenizer = load_model_and_tokenizer(
+        args.model_path,
+        args.device,
+        args.dtype,
+        args.attn_implementation,
+        args.to_bettertransformer,
+        args.gradient_checkpointing,
+    )
+
     with torch.no_grad():
-        outputs: CausalLMOutputWithPast = model(
-            **reconstructed_token_inputs,
-            output_hidden_states=True,
+        # Get logits and hidden states for all tokens
+        full_outputs: CausalLMOutputWithPast = model(
+            full_token_ids, output_hidden_states=True
         )
 
         # Realism loss
-        start = 0
-        if has_prefix:
-            start = prefix_token_embeddings.shape[0]
-
-        offset = closest_idx.shape[1]
-        end = start + offset
-
-        realism_log_probs = -F.cross_entropy(
-            outputs.logits[0, start : end - 1],
-            merged_input_token_ids[0, start + 1 : end],
-            reduction="none",
+        logits, targets = realism_loss_input_helper(
+            full_outputs.logits,
+            adv_token_ids,
+            has_prefix,
+            num_prefix_tokens,
+            num_adv_tokens,
         )
-
-        realism_probs = torch.exp(realism_log_probs)
-        realism_sum_log_prob = realism_log_probs.sum()
-        realism_mean_log_prob = torch.log(realism_probs.mean())
-
-        realism_sum_prob = torch.exp(realism_sum_log_prob)
-        realism_mean_prob = torch.exp(realism_mean_log_prob)
+        realism_metrics = get_cross_entropy_metrics(logits, targets)
 
     if has_probe:
         # Load probe
-        probe_params = safetensors.numpy.load_file(
-            f"{args.probe_path}/probe.safetensors"
+        probe, _ = load_probe(
+            args.probe_path, embedding_dim, probe_layer_id, args.device
         )
-        probe = nn.Linear(embedding_dim, 1)
-
-        with torch.no_grad():
-            probe.weight.data.copy_(torch.from_numpy(probe_params["weight"]))
-            probe.bias.data.copy_(torch.from_numpy(probe_params["bias"]))
-            probe.to(dtype=torch.float32, device=args.device)
 
         # Get probe loss
         with torch.no_grad():
-            features = outputs.hidden_states[probe_layer_id][:, -1]
-            logits = probe(features.to(torch.float32))
-
-            if args.probe_loss == "bce":
-                probe_loss = F.binary_cross_entropy_with_logits(logits, target_label)
-            if args.probe_loss == "direct":
-                probe_loss = -torch.mean(logits * target_label)
+            probe_loss, probe_logits = probe_loss_fn(
+                probe,
+                probe_layer_id,
+                full_outputs.hidden_states,
+                target_label,
+                num_input_tokens,
+                args.probe_loss,
+            )
 
             print(f"Probe Loss : {probe_loss.item():.2e}")
 
     if has_target:
-        reconstructed_full_inputs = tokenizer(
-            merged_input_with_target_tokens,
-            add_special_tokens=False,
-            return_tensors="pt",
-        ).to(args.device)
-
-        # Check if round-trip decoding-encoding recovers the input
-        assert (
-            merged_input_with_target_token_ids.shape[1]
-            == reconstructed_full_inputs.input_ids.shape[1]
-        ), f"{merged_input_with_target_token_ids.shape[1]} | {reconstructed_full_inputs.input_ids.shape[1]}"
-
-        assert torch.all(
-            merged_input_with_target_token_ids == reconstructed_full_inputs.input_ids
-        )
-
         with torch.no_grad():
-            # Get target loss and likelihood
-            outputs: CausalLMOutputWithPast = model(
-                **reconstructed_full_inputs,
+            # Get target loss
+            logits, targets = target_loss_input_helper(
+                full_outputs.logits, target_token_ids, num_input_tokens
             )
-
-            logits = outputs.logits[0, -target_token_ids.shape[1] - 1 : -1]
-            target_log_probs = -F.cross_entropy(
-                logits, target_token_ids[0], reduction="none"
-            )
-            target_probs = torch.exp(target_log_probs)
-            target_sum_log_prob = target_log_probs.sum()
-            target_mean_log_prob = torch.log(target_probs.mean())
-
-            target_sum_prob = torch.exp(target_sum_log_prob)
-            target_mean_prob = torch.exp(target_mean_log_prob)
+            target_metrics = get_cross_entropy_metrics(logits, targets)
 
             # Sample most likely continuation
-            model_continuation = model.generate(
-                **reconstructed_token_inputs,
-                max_new_tokens=target_token_ids.shape[1] * 4,
+            generated_token_ids = model.generate(
+                full_token_ids, max_new_tokens=target_token_ids.shape[1] * 4
             )
-            model_continuation_text = tokenizer.batch_decode(model_continuation)
+            generated_tokens = tokenizer.batch_decode(generated_token_ids)
 
-            print(f"Model Continuation: {model_continuation_text[0]}")
+            print(f"Model Continuation: {generated_tokens}")
 
     # Save results
     if exists(args.output_path):
         os.makedirs(f"{args.output_path}", exist_ok=True)
         with open(f"{args.output_path}/adversarial_tokens.json", mode="w") as f:
-            data = {
-                "adv_token_ids": max_token_ids_list,
-                "adv_tokens": max_tokens,
-                "merged_token_ids": merged_input_token_ids_list,
-                "merged_tokens": merged_input_tokens,
-            }
+            data = {"adv_token_ids": adv_token_ids.tolist(), "adv_tokens": adv_tokens}
 
-            data["realism_probs"] = realism_probs.cpu().numpy().tolist()
-            data["realism_log_probs"] = realism_log_probs.cpu().numpy().tolist()
-            data["realism_sum_prob"] = realism_sum_prob.item()
-            data["realism_sum_log_prob"] = realism_sum_log_prob.item()
-            data["realism_mean_prob"] = realism_mean_prob.item()
-            data["realism_mean_log_prob"] = realism_mean_log_prob.item()
+            data.update(
+                dict_prefix_keys(torch_dict_to_python(realism_metrics), "realism_")
+            )
 
             if has_probe:
-                data["probe_logits"] = logits.item()
+                data["probe_logits"] = probe_logits.item()
                 data["probe_targets"] = target_label.item()
 
             if has_target:
-                data["target_probs"] = target_probs.cpu().numpy().tolist()
-                data["target_log_probs"] = target_log_probs.cpu().numpy().tolist()
-                data["target_sum_prob"] = target_sum_prob.item()
-                data["target_sum_log_prob"] = target_sum_log_prob.item()
-                data["target_mean_prob"] = target_mean_prob.item()
-                data["target_mean_log_prob"] = target_mean_log_prob.item()
-
-                data["continuation_token_ids"] = (
-                    model_continuation.cpu().numpy().tolist()[0]
+                data.update(
+                    dict_prefix_keys(torch_dict_to_python(target_metrics), "target_")
                 )
-                data["continuation_tokens"] = model_continuation_text[0]
+
+                data["generated_token_ids"] = generated_token_ids.tolist()
+                data["generated_tokens"] = generated_tokens
 
             json.dump(data, f, indent=4)
 
