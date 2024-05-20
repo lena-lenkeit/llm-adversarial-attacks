@@ -154,16 +154,21 @@ def probe_loss_fn(
     target: torch.FloatTensor,
     num_input_tokens: int,
     loss_type: Literal["bce", "direct"],
+    logit_bias: float = 0.0,
+    logit_scale: float = 1.0,
 ):
     features = hidden_activations[probe_layer_id][:, num_input_tokens - 1]
     logits = probe(features.to(torch.float32))
+    z = (logits + logit_bias) * logit_scale
 
     if loss_type == "bce":
         probe_loss = F.binary_cross_entropy_with_logits(logits, target)
     elif loss_type == "direct":
         probe_loss = -torch.mean(logits * target)
+    elif loss_type == "z_direct":
+        probe_loss = -torch.mean(z * target)
 
-    return probe_loss, logits
+    return probe_loss, logits, z
 
 
 def target_loss_input_helper(
@@ -220,6 +225,7 @@ def load_probe(
 ):
     # Load probe data
     probe_data = safetensors.numpy.load_file(f"{probe_path}/probe.safetensors")
+    probe_eval = safetensors.numpy.load_file(f"{probe_path}/eval.safetensors")
 
     # Initialize probe
     probe = nn.Linear(embedding_dim, 1)
@@ -233,7 +239,11 @@ def load_probe(
     if not exists(probe_layer_id):
         probe_layer_id = int(probe_data["train_layer_id"])
 
-    return probe, probe_layer_id
+    # Infer scale and bias for z loss
+    bias = -probe_eval["test_logits"].mean()
+    scale = 1 / probe_eval["test_logits"].std()
+
+    return probe, probe_layer_id, (bias, scale)
 
 
 def mix_embeddings(mixing_factors: torch.Tensor, embedding_matrix: torch.Tensor):
@@ -369,7 +379,7 @@ def main(args: argparse.Namespace):
     # Construct probe (again in float32 to avoid precision issues)
     probe_layer_id = args.layer_id
     if has_probe:
-        probe, probe_layer_id = load_probe(
+        probe, probe_layer_id, (probe_logit_bias, probe_logit_scale) = load_probe(
             args.probe_path, embedding_dim, probe_layer_id, args.device
         )
         target_label = torch.FloatTensor([[args.probe_target_label]]).to(args.device)
@@ -514,13 +524,15 @@ def main(args: argparse.Namespace):
 
         probe_loss = 0.0
         if has_probe:
-            probe_loss, _ = probe_loss_fn(
+            probe_loss, probe_logits, probe_z = probe_loss_fn(
                 probe,
                 probe_layer_id,
                 outputs.hidden_states,
                 target_label,
                 num_input_tokens,
                 args.probe_loss,
+                probe_logit_bias,
+                probe_logit_scale,
             )
 
         target_loss = 0.0
@@ -648,6 +660,8 @@ def main(args: argparse.Namespace):
             postfix_dict["mean_sq_dist"] = torch.mean(closest_sq_distances)
         if has_probe:
             postfix_dict["probe_loss"] = probe_loss
+            postfix_dict["probe_logits"] = probe_logits
+            postfix_dict["probe_z"] = probe_z
         if has_target:
             postfix_dict["target_loss"] = target_loss
         if args.regularization_type:
@@ -741,19 +755,21 @@ def main(args: argparse.Namespace):
 
     if has_probe:
         # Load probe
-        probe, _ = load_probe(
+        probe, _, (probe_logit_bias, probe_logit_scale) = load_probe(
             args.probe_path, embedding_dim, probe_layer_id, args.device
         )
 
         # Get probe loss
         with torch.no_grad():
-            probe_loss, probe_logits = probe_loss_fn(
+            probe_loss, probe_logits, probe_z = probe_loss_fn(
                 probe,
                 probe_layer_id,
                 full_outputs.hidden_states,
                 target_label,
                 num_input_tokens,
                 args.probe_loss,
+                probe_logit_bias,
+                probe_logit_scale,
             )
 
             print(f"Probe Loss : {probe_loss.item():.2e}")
@@ -786,6 +802,7 @@ def main(args: argparse.Namespace):
 
             if has_probe:
                 data["probe_logits"] = probe_logits.item()
+                data["probe_z"] = probe_z.item()
                 data["probe_targets"] = target_label.item()
 
             if has_target:
@@ -951,7 +968,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--probe_loss",
         type=str,
-        choices=["bce", "direct"],
+        choices=["bce", "direct", "z_direct"],
         default="direct",
         help="Loss type for probe",
     )
