@@ -638,11 +638,12 @@ def main(args: argparse.Namespace):
         # Add postfix to pbar
         postfix_dict = {
             "lr": optimizer.param_groups[0]["lr"],
-            "best_total_loss": best_loss,
-            "total_loss": loss,
+            "best_loss": best_loss,
+            "loss": loss,
         }
+
         if args.num_stages > 1:
-            postfix_dict["current_stage"] = current_stage
+            postfix_dict["stage"] = current_stage
         if args.space == "embeddings":
             postfix_dict["mean_sq_dist"] = torch.mean(closest_sq_distances)
         if has_probe:
@@ -650,11 +651,26 @@ def main(args: argparse.Namespace):
         if has_target:
             postfix_dict["target_loss"] = target_loss
         if args.regularization_type:
-            postfix_dict["regularization_loss"] = reg_loss
+            postfix_dict["reg_loss"] = reg_loss
         if args.realism_loss:
-            postfix_dict["likelihood_loss"] = realism_loss
+            postfix_dict["ll_loss"] = realism_loss
 
-        postfix_str = " ".join([f"{k}: {v:.2e}" for k, v in postfix_dict.items()])
+        def to_python(x):
+            if isinstance(x, torch.Tensor):
+                x = x.item()
+
+            if isinstance(x, float):
+                x = f"{x:.2e}"
+            elif isinstance(x, int):
+                x = f"{x}"
+            else:
+                raise TypeError(x, type(x))
+
+            return x
+
+        postfix_str = " ".join(
+            [f"{k}: {to_python(v)}" for k, v in postfix_dict.items()]
+        )
         pbar.set_postfix_str(postfix_str)
 
     # Get best token ids
