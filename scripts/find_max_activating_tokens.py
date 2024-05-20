@@ -916,7 +916,7 @@ if __name__ == "__main__":
         "--method",
         type=str,
         choices=["soft_softmax", "hard_softmax", "hard_gumbel_softmax"],
-        default="soft_softmax",
+        default="hard_softmax",
         help="Optimization method when optimizing in token space",
     )
     parser.add_argument(
