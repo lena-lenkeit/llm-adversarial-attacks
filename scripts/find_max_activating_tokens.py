@@ -275,6 +275,10 @@ def check_roundtrip(input: torch.LongTensor, roundtrip: torch.LongTensor):
     return shape_check and content_check
 
 
+def batch_check_roundtrip(input: torch.LongTensor, roundtrip: torch.LongTensor):
+    return torch.BoolTensor([check_roundtrip(i, r) for i, r in zip(input, roundtrip)])
+
+
 def main(args: argparse.Namespace):
     # TODO: Multi-probe, Multi-Target optimization
     # TODO: Investigate the case where the dec-enc roundtrip fails
@@ -755,11 +759,21 @@ def main(args: argparse.Namespace):
     roundtrip_full_token_ids = tokenize_text(full_tokens)
 
     # Check if round-trip decoding-encoding recovers the input
-    roundtrip_adv_check = check_roundtrip(adv_token_ids, roundtrip_adv_token_ids)
-    roundtrip_input_check = check_roundtrip(input_token_ids, roundtrip_input_token_ids)
-    roundtrip_full_check = check_roundtrip(full_token_ids, roundtrip_full_token_ids)
+    roundtrip_adv_check = batch_check_roundtrip(adv_token_ids, roundtrip_adv_token_ids)
+    roundtrip_input_check = batch_check_roundtrip(
+        input_token_ids, roundtrip_input_token_ids
+    )
+    roundtrip_full_check = batch_check_roundtrip(
+        full_token_ids, roundtrip_full_token_ids
+    )
 
-    assert roundtrip_adv_check and roundtrip_input_check and roundtrip_full_check
+    roundtrip_all_check = torch.logical_and(
+        torch.logical_and(roundtrip_adv_check, roundtrip_input_check),
+        roundtrip_full_check,
+    )
+    if not torch.all(roundtrip_all_check):
+        print("At least one batch failed the roundtrip check! Check output manually...")
+        print(roundtrip_all_check)
 
     # Reload model and tokenizer
     model, tokenizer = load_model_and_tokenizer(
@@ -806,7 +820,7 @@ def main(args: argparse.Namespace):
                 probe_logit_scale,
             )
 
-            print(f"Probe Loss : {probe_loss.item():.2e}")
+            print(f"Probe Loss : {probe_loss.mean().item():.2e}")
 
     if has_target:
         with torch.no_grad():
@@ -828,7 +842,14 @@ def main(args: argparse.Namespace):
     if exists(args.output_path):
         os.makedirs(f"{args.output_path}", exist_ok=True)
         with open(f"{args.output_path}/adversarial_tokens.json", mode="w") as f:
-            data = {"adv_token_ids": adv_token_ids.tolist(), "adv_tokens": adv_tokens}
+            data = {
+                "roundtrip_adv_check": roundtrip_adv_check.tolist(),
+                "roundtrip_input_check": roundtrip_input_check.tolist(),
+                "roundtrip_full_check": roundtrip_full_check.tolist(),
+                "roundtrip_all_check": roundtrip_all_check.tolist(),
+                "adv_token_ids": adv_token_ids.tolist(),
+                "adv_tokens": adv_tokens,
+            }
 
             data.update(
                 dict_prefix_keys(torch_dict_to_python(realism_metrics), "realism_")
