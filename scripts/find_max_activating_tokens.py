@@ -273,16 +273,10 @@ def check_roundtrip(input: torch.LongTensor, roundtrip: torch.LongTensor):
 
 
 def main(args: argparse.Namespace):
-    # TODO: Make realism loss work with all methods
-    # TODO: Fix realism loss to correctly consider prefix tokens and postfix/target
-    # tokens when present
-    # TODO: Batch optimization
     # TODO: Multi-probe, Multi-Target optimization
     # TODO: Investigate the case where the dec-enc roundtrip fails
     # TODO: Add special tokens for correctness, if they exist
-    # TODO: Check compatibility with dictionary feature again
     # TODO: Check over this entire script again, clean up stuff, make sure impl. is good
-    # TODO: Check logit-distribution of probes on normal data as reference
     # TODO: Think about what to do with step-optimization and token space
 
     # NOTE: Letting it train in embedding space with lr 1e2 for a long time seems to do
