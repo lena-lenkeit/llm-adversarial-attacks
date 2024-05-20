@@ -67,8 +67,6 @@ def exists(x: Any | None) -> bool:
 
 class ConstantOrSchedule:
     def __init__(self, values: List[float] | None, num_steps: int):
-        print(values)
-
         if values is None:
             self.schedule = None
         elif len(values) == 1:
@@ -96,13 +94,17 @@ def safetensors_load_file_metadata(filename: str):
     return header_dict["__metadata__"]
 
 
-def get_cross_entropy_metrics(logits: torch.FloatTensor, targets: torch.LongTensor):
+def get_cross_entropy_metrics(
+    logits: torch.FloatTensor,
+    targets: torch.LongTensor,
+    dim: int | Tuple[int, ...] | None = None,
+):
     cross_entropy = F.cross_entropy(logits, targets, reduction="none")
     log_probs = -cross_entropy
 
     probs = torch.exp(log_probs)
-    total_log_prob = log_probs.sum()
-    mean_log_prob = torch.log(probs.mean())
+    total_log_prob = log_probs.sum(dim=dim)
+    mean_log_prob = torch.log(probs.mean(dim=dim))
 
     total_prob = torch.exp(total_log_prob)
     mean_prob = torch.exp(mean_log_prob)
@@ -141,8 +143,8 @@ def realism_loss_input_helper(
 
     end = start + offset
 
-    adv_logits = rearrange(logits[:, start : end - 1], "b t f -> (b t) f")
-    adv_targets = rearrange(adv_token_ids[:, 1:], "b t -> (b t)")
+    adv_logits = rearrange(logits[:, start : end - 1], "b t f -> b f t")
+    adv_targets = rearrange(adv_token_ids[:, 1:], "b t -> b t")
 
     return adv_logits, adv_targets
 
@@ -174,8 +176,8 @@ def probe_loss_fn(
 def target_loss_input_helper(
     logits: torch.FloatTensor, target_token_ids: torch.LongTensor, num_input_tokens: int
 ):
-    return rearrange(logits[:, num_input_tokens:], "b t f -> (b t) f"), rearrange(
-        target_token_ids, "b t -> (b t)"
+    return rearrange(logits[:, num_input_tokens:], "b t f -> b f t"), rearrange(
+        target_token_ids, "b t -> b t"
     )
 
 
@@ -207,6 +209,8 @@ def load_model_and_tokenizer(
         attn_implementation=attn_implementation,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if to_bettertransformer:
         model = model.to_bettertransformer()
@@ -369,7 +373,9 @@ def main(args: argparse.Namespace):
 
     # Initialize embeddings from random tokens
     if args.space == "embeddings":
-        init_token_ids = torch.randint(vocab_size, size=(1, args.num_tokens))
+        init_token_ids = torch.randint(
+            vocab_size, size=(args.batch_size, args.num_tokens)
+        )
         init_token_ids = init_token_ids.to(args.device)
 
         input_token_embeddings = embedding_matrix[init_token_ids].clone()
@@ -381,7 +387,9 @@ def main(args: argparse.Namespace):
         probe, probe_layer_id, (probe_logit_bias, probe_logit_scale) = load_probe(
             args.probe_path, embedding_dim, probe_layer_id, args.device
         )
-        target_label = torch.FloatTensor([[args.probe_target_label]]).to(args.device)
+        target_label = torch.FloatTensor(
+            [[args.probe_target_label]] * args.batch_size
+        ).to(args.device)
 
     # Construct optimizer
     # TODO: Add handling for adam betas and general optim kwargs
@@ -389,7 +397,7 @@ def main(args: argparse.Namespace):
 
     if args.space == "tokens":
         token_mixing_logits = torch.randn(
-            (1, args.num_tokens, vocab_size),
+            (args.batch_size, args.num_tokens, vocab_size),
             device=args.device,
             dtype=torch.float32,
             requires_grad=True,
@@ -670,7 +678,7 @@ def main(args: argparse.Namespace):
 
         def to_python(x):
             if isinstance(x, torch.Tensor):
-                x = x.item()
+                x = x.mean().item()
 
             if isinstance(x, float):
                 x = f"{x:.2e}"
@@ -722,6 +730,15 @@ def main(args: argparse.Namespace):
     full_tokens = tokenizer.batch_decode(full_token_ids)
 
     # Re-encode for round-trip consistency check
+    def tokenize_text(text: str):
+        return tokenizer(
+            text,
+            truncation=True,
+            padding=True,
+            max_length=args.num_tokens,
+            return_tensors="pt",
+        ).input_ids.to(args.device)
+
     roundtrip_adv_token_ids = tokenize_text(adv_tokens)
     roundtrip_input_token_ids = tokenize_text(input_tokens)
     roundtrip_full_token_ids = tokenize_text(full_tokens)
@@ -757,7 +774,7 @@ def main(args: argparse.Namespace):
             num_prefix_tokens,
             num_adv_tokens,
         )
-        realism_metrics = get_cross_entropy_metrics(logits, targets)
+        realism_metrics = get_cross_entropy_metrics(logits, targets, dim=1)
 
     if has_probe:
         # Load probe
@@ -786,7 +803,7 @@ def main(args: argparse.Namespace):
             logits, targets = target_loss_input_helper(
                 full_outputs.logits, target_token_ids, num_input_tokens
             )
-            target_metrics = get_cross_entropy_metrics(logits, targets)
+            target_metrics = get_cross_entropy_metrics(logits, targets, dim=1)
 
             # Sample most likely continuation
             generated_token_ids = model.generate(
@@ -807,9 +824,9 @@ def main(args: argparse.Namespace):
             )
 
             if has_probe:
-                data["probe_logits"] = probe_logits.item()
-                data["probe_z"] = probe_z.item()
-                data["probe_targets"] = target_label.item()
+                data["probe_logits"] = probe_logits.tolist()
+                data["probe_z"] = probe_z.tolist()
+                data["probe_targets"] = target_label.tolist()
 
             if has_target:
                 data.update(
@@ -924,6 +941,12 @@ if __name__ == "__main__":
         choices=["soft_softmax", "hard_softmax", "hard_gumbel_softmax"],
         default="hard_softmax",
         help="Optimization method when optimizing in token space",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Number of adversarial sequences to find in parallel",
     )
     parser.add_argument(
         "--lr",
