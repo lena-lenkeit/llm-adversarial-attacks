@@ -132,6 +132,21 @@ def get_metric(
         return evals.test_metrics.roc_auc
 
 
+def find_best(
+    evals: List[ProbeEvals], metric: Literal["train_roc_auc", "test_roc_auc"]
+):
+    best_id = 0
+    best_metric_value = get_metric(evals[0], metric)
+
+    for i, probe_evals in enumerate(evals[1:], start=1):
+        probe_metric_value = get_metric(probe_evals, metric)
+        if probe_metric_value > best_metric_value:
+            best_id = i
+            best_metric_value = probe_metric_value
+
+    return best_id, best_metric_value
+
+
 def main(args: argparse.Namespace):
     # Load dataset
     dataset = datasets.load_from_disk(args.activation_path)
@@ -151,29 +166,35 @@ def main(args: argparse.Namespace):
         evals.append(probe_eval)
 
     # Find best probe
-    best_id = 0
-    best_roc_auc = get_metric(evals[0], args.best_metric)
-
-    for i, probe_evals in enumerate(evals[1:], start=1):
-        probe_roc_auc = get_metric(probe_evals, args.best_metric)
-        if probe_roc_auc > best_roc_auc:
-            best_id = i
-            best_roc_auc = probe_roc_auc
+    best_train_id, _ = find_best(evals, "train_roc_auc")
+    best_test_id, _ = find_best(evals, "test_roc_auc")
 
     # Save run info
     os.makedirs(args.probe_path, exist_ok=True)
     with open(f"{args.probe_path}/info.json", mode="w") as f:
         info = {
             "activation_path": args.activation_path,
-            "best_layer_id": probes[best_id].train_layer_id,
-            "best_test_roc_auc": best_roc_auc,
+            # Layer IDs of best probes for both splits
+            "best_train_split_layer_id": probes[best_train_id].train_layer_id,
+            "best_test_split_layer_id": probes[best_test_id].train_layer_id,
+            # Train/Test metrics of best probe according to the training metrics
+            "best_train_split_train_roc_auc": evals[
+                best_train_id
+            ].train_metrics.roc_auc,
+            "best_train_split_test_roc_auc": evals[best_train_id].test_metrics.roc_auc,
+            # Train/Test metrics of best probe according to the tetsing metrics
+            "best_test_split_train_roc_auc": evals[best_test_id].train_metrics.roc_auc,
+            "best_test_split_test_roc_auc": evals[best_test_id].test_metrics.roc_auc,
         }
 
         json.dump(info, f, indent=4)
 
     # Save probes
-    save_probe(probes[best_id], f"{args.probe_path}/best")
-    save_eval(evals[best_id], f"{args.probe_path}/best")
+    save_probe(probes[best_train_id], f"{args.probe_path}/best_train")
+    save_eval(evals[best_train_id], f"{args.probe_path}/best_train")
+
+    save_probe(probes[best_test_id], f"{args.probe_path}/best_test")
+    save_eval(evals[best_test_id], f"{args.probe_path}/best_test")
 
     for probe, probe_eval in zip(probes, evals):
         save_probe(probe, f"{args.probe_path}/layer_{probe.train_layer_id}")
@@ -206,13 +227,6 @@ if __name__ == "__main__":
         type=int,
         default=1000000,
         help="Maximum number of iterations for the logistic regression to converge.",
-    )
-    parser.add_argument(
-        "--best_metric",
-        type=str,
-        choices=["train_roc_auc", "test_roc_auc"],
-        default="train_roc_auc",
-        help="Metric to use to select the best probe among all probes.",
     )
 
     args = parser.parse_args()
