@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -123,6 +123,15 @@ def save_eval(probe_eval: ProbeEvals, probe_path: str, metadata: Dict[str, str] 
     )
 
 
+def get_metric(
+    evals: ProbeEvals, metric: Literal["train_roc_auc", "test_roc_auc"]
+) -> float:
+    if metric == "train_roc_auc":
+        return evals.train_metrics.roc_auc
+    elif metric == "test_roc_auc":
+        return evals.test_metrics.roc_auc
+
+
 def main(args: argparse.Namespace):
     # Load dataset
     dataset = datasets.load_from_disk(args.activation_path)
@@ -143,10 +152,10 @@ def main(args: argparse.Namespace):
 
     # Find best probe
     best_id = 0
-    best_roc_auc = evals[0].test_metrics.roc_auc
+    best_roc_auc = get_metric(evals[0], args.best_metric)
 
-    for i, probe in enumerate(evals[1:], start=1):
-        probe_roc_auc = probe.test_metrics.roc_auc
+    for i, probe_evals in enumerate(evals[1:], start=1):
+        probe_roc_auc = get_metric(probe_evals, args.best_metric)
         if probe_roc_auc > best_roc_auc:
             best_id = i
             best_roc_auc = probe_roc_auc
@@ -197,6 +206,13 @@ if __name__ == "__main__":
         type=int,
         default=1000000,
         help="Maximum number of iterations for the logistic regression to converge.",
+    )
+    parser.add_argument(
+        "--best_metric",
+        type=str,
+        choices=["train_roc_auc", "test_roc_auc"],
+        default="train_roc_auc",
+        help="Metric to use to select the best probe among all probes.",
     )
 
     args = parser.parse_args()
