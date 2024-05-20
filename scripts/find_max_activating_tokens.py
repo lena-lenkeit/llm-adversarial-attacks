@@ -164,11 +164,14 @@ def probe_loss_fn(
     z = (logits + logit_bias) * logit_scale
 
     if loss_type == "bce":
-        probe_loss = F.binary_cross_entropy_with_logits(logits, target)
+        probe_loss = F.binary_cross_entropy_with_logits(
+            logits, target, reduction="none"
+        )
+        probe_loss = torch.mean(probe_loss, dim=1)
     elif loss_type == "direct":
-        probe_loss = -torch.mean(logits * target)
+        probe_loss = -torch.mean(logits * target, dim=1)
     elif loss_type == "z_direct":
-        probe_loss = -torch.mean(z * target)
+        probe_loss = -torch.mean(z * target, dim=1)
 
     return probe_loss, logits, z
 
@@ -281,8 +284,8 @@ def main(args: argparse.Namespace):
 
     # NOTE: Letting it train in embedding space with lr 1e2 for a long time seems to do
     # wonders for the realism loss. With 4096 steps and 4 1e-1 stages, I got the realism
-    # loss down to 2.79 . Maybe training even longer, without stages, a different lr would
-    # give super realistic samples.
+    # loss down to 2.79 . Maybe training even longer, without stages, a different lr
+    # would give super realistic samples.
 
     # Infer values
     has_prefix = exists(args.prefix_text)
@@ -506,22 +509,22 @@ def main(args: argparse.Namespace):
                 token_mixing_logits * temp_schedule[i], dim=-1
             )
             entropy = -torch.sum(token_mixing_probs * token_mixing_logprobs, dim=-1)
-            reg_loss = torch.mean(entropy)
+            reg_loss = torch.mean(entropy, dim=1)
         elif args.regularization_type == "max_probability":
             token_mixing_probs = token_mixing_soft
-            reg_loss = -torch.mean(torch.max(token_mixing_probs, dim=-1)[0])
+            reg_loss = -torch.mean(torch.max(token_mixing_probs, dim=-1)[0], dim=1)
         elif args.regularization_type == "abs_dist":
-            reg_loss = torch.mean(torch.sqrt(torch.clip(sq_dist, min=1e-10)))
+            reg_loss = torch.mean(torch.sqrt(torch.clip(sq_dist, min=1e-10)), dim=1)
         elif args.regularization_type == "closest_sq_dist":
-            reg_loss = torch.mean(closest_sq_distances)
+            reg_loss = torch.mean(closest_sq_distances, dim=1)
         elif args.regularization_type == "closest_log_sq_dist":
             reg_loss = torch.mean(
-                torch.log(torch.clip(closest_sq_distances, min=1e-10))
+                torch.log(torch.clip(closest_sq_distances, min=1e-10)), dim=1
             )
         elif args.regularization_type == "softmin_kernel":
-            reg_loss = torch.mean(softmin_kernel(sq_dist, temp_schedule[i]))
+            reg_loss = torch.mean(softmin_kernel(sq_dist, temp_schedule[i]), dim=1)
         elif args.regularization_type == "hard_kernel":
-            reg_loss = torch.mean(hard_kernel(sq_dist, temp_schedule[i]))
+            reg_loss = torch.mean(hard_kernel(sq_dist, temp_schedule[i]), dim=1)
 
         probe_loss = 0.0
         if has_probe:
@@ -541,7 +544,8 @@ def main(args: argparse.Namespace):
             logits, targets = target_loss_input_helper(
                 outputs.logits, target_token_ids, num_input_tokens
             )
-            target_loss = F.cross_entropy(logits, targets)
+            target_loss = F.cross_entropy(logits, targets, reduction="none")
+            target_loss = torch.mean(target_loss, dim=1)
 
         realism_loss = 0.0
         if args.realism_loss:
@@ -552,17 +556,30 @@ def main(args: argparse.Namespace):
                 num_prefix_tokens,
                 num_adv_tokens,
             )
-            realism_loss = F.cross_entropy(logits, targets)
+            realism_loss = F.cross_entropy(logits, targets, reduction="none")
+            realism_loss = torch.mean(realism_loss, dim=1)
 
         loss = probe_loss + target_loss + reg_loss * reg_schedule[i] + realism_loss
 
         # Store best tokens
-        if loss < best_loss:
-            best_loss = loss
+        with torch.no_grad():
+            update_best_mask = loss < best_loss
+            best_loss = torch.where(update_best_mask, loss, best_loss)
+
             if args.space == "tokens":
-                best_token_values = token_mixing_logits.clone()
+                best_token_values = torch.where(
+                    rearrange(update_best_mask, "b -> b 1 1"),
+                    token_mixing_logits,
+                    best_token_values,
+                )
             elif args.space == "embeddings":
-                best_token_values = closest_embeddings.clone()
+                best_token_values = torch.where(
+                    rearrange(update_best_mask, "b -> b 1 1"),
+                    closest_embeddings,
+                    best_token_values,
+                )
+
+        loss = torch.mean(loss, dim=0)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
