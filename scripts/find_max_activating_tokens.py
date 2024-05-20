@@ -317,7 +317,6 @@ def main(args: argparse.Namespace):
     embedding_matrix = embedding_layer.weight.data.clone().to(
         dtype=torch.float32, device=args.device
     )
-    embedding_id_to_token_id_mapping = None
 
     def tokenize_text(text: str) -> torch.LongTensor:
         return (
@@ -694,6 +693,13 @@ def main(args: argparse.Namespace):
     elif args.space == "embeddings":
         # Ids of closest tokens in dictionary
         adv_token_ids = get_closest(best_token_values, embedding_matrix)[2]
+
+    # Backtranslate if dictionary was used
+    if has_dictionary:
+        mapping = torch.LongTensor(embedding_id_to_token_id_mapping.values())
+        mapping = mapping.to(args.device)
+
+        adv_token_ids = mapping[adv_token_ids]
 
     # Reconstruct full input (including prefix and postfix)
     to_merge = []
