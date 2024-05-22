@@ -97,7 +97,7 @@ def residual_patch_fn(
     set_project: bool,
 ):
     residual_dtype = residual.dtype
-    residual.to(torch.float32)
+    residual = residual.to(torch.float32)
 
     if not patch_all and residual.shape[1] == 1:
         return residual
@@ -120,7 +120,7 @@ def residual_patch_fn(
     if not patch_all:
         patched = torch.cat((residual[:, :-1], patched[:, -1:]), dim=1)
 
-    patched.to(residual_dtype)
+    patched = patched.to(residual_dtype)
     return patched
 
 
