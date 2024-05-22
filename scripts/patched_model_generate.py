@@ -9,7 +9,7 @@ import safetensors.numpy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+from einops import einsum, rearrange
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -88,20 +88,40 @@ def load_probe(
 
 
 def residual_patch_fn(
-    residual: torch.Tensor, patch: torch.Tensor, patch_all: bool, additive: bool
+    residual: torch.Tensor,
+    patch: torch.Tensor,
+    strength: float,
+    patch_all: bool,
+    additive: bool,
+    set: bool,
+    set_project: bool,
 ):
+    residual_dtype = residual.dtype
+    residual.to(torch.float32)
+
     if not patch_all and residual.shape[1] == 1:
         return residual
 
     if additive:
-        patched = residual + patch
-    else:
-        patched = torch.broadcast_to(patch, residual.shape)
+        patched = residual + patch * strength
+    if set:
+        patched = torch.broadcast_to(patch * strength, residual.shape)
+    if set_project:
+        # Remove patch from residual
+        patch_normalized = patch / torch.linalg.vector_norm(patch, dim=-1, keepdim=True)
+        patch_factor = einsum(residual, patch_normalized, "... d, ... d -> ...")
+        patch_factor = rearrange(patch_factor, "... -> ... 1")
+        patch_component = patch_factor * patch_normalized
+        residual_without_patch = residual - patch_component
+
+        # Patch back in at specific strength
+        patched = residual_without_patch + patch * strength
 
     if not patch_all:
-        return torch.cat((residual[:, :-1], patched[:, -1:]), dim=1)
-    else:
-        return patched
+        patched = torch.cat((residual[:, :-1], patched[:, -1:]), dim=1)
+
+    patched.to(residual_dtype)
+    return patched
 
 
 def patched_layer_hook(
@@ -135,24 +155,41 @@ def main(args: argparse.Namespace):
     )
 
     # Load probe
-    probe, probe_layer_id, _ = load_probe(
+    probe, probe_layer_id, (probe_logit_bias, probe_logit_scale) = load_probe(
         args.probe_path, model.config.hidden_size, args.layer_id, args.device
     )
 
-    # Create intervention
-    intervention = rearrange(probe.weight[0], "d -> 1 1 d") * args.strength
-    print(intervention)
+    # Create patch
+    patch = probe.weight[0]
+    patch_strength = args.strength
+    patch_set_project = args.set_project
+
+    if args.normalize_probe:
+        patch = patch / torch.linalg.vector_norm(patch, dim=-1, keepdim=True)
+
+    if args.set_logit or args.set_z:
+        assert not args.normalize_probe
+
+        if args.set_z:
+            patch_strength = patch_strength / probe_logit_scale - probe_logit_bias
+
+        patch_set_project = True
+        patch_norm = torch.linalg.vector_norm(patch, dim=-1, keepdim=True)
+        patch_strength = (patch_strength - probe.bias[0]) / patch_norm**2
+
+    patch_fn = partial(
+        residual_patch_fn,
+        patch=patch,
+        strength=patch_strength,
+        patch_all=args.patch_all,
+        additive=args.additive,
+        set=args.set,
+        set_project=patch_set_project,
+    )
 
     # Patch forward hook into model
     num_model_layers = model.config.num_hidden_layers
     is_model_output = probe_layer_id == num_model_layers
-
-    patch_fn = partial(
-        residual_patch_fn,
-        patch=intervention,
-        patch_all=args.patch_all,
-        additive=args.additive,
-    )
 
     if isinstance(model, GPTNeoXForCausalLM):
         if is_model_output:
@@ -226,7 +263,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--probe_path",
         type=str,
-        default="probes/pythia-410m-aclimdb-v2/best_test",
+        default="probes/pythia-410m-aclimdb-v2/best_train",
         help="Path to the probe file",
     )
     parser.add_argument(
@@ -237,6 +274,11 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--normalize_probe",
+        action="store_true",
+        help="Set to L2-normalize probe scale.",
+    )
+    parser.add_argument(
         "--strength",
         type=float,
         default=0.1,
@@ -246,6 +288,24 @@ if __name__ == "__main__":
         "--patch_all",
         action="store_true",
         help="Set to patch at all positions in the sequence.",
+    )
+    parser.add_argument(
+        "--set", action="store_true", help="Set to replace residuals with patch."
+    )
+    parser.add_argument(
+        "--set_project",
+        action="store_true",
+        help="Set to replace residuals with patch only along the patch vector.",
+    )
+    parser.add_argument(
+        "--set_logit",
+        action="store_true",
+        help="Set to offset residual to give a specific probe logit.",
+    )
+    parser.add_argument(
+        "--set_z",
+        action="store_true",
+        help="Set to offset residual to give a specific probe z-score.",
     )
     parser.add_argument(
         "--additive", action="store_true", help="Set to add patch to residuals."
