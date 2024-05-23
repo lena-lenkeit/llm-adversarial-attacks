@@ -195,6 +195,7 @@ def load_model_and_tokenizer(
     attn_implementation: str,
     to_bettertransformer: bool | None,
     gradient_checkpointing: bool | None,
+    cache_dir: str | None,
 ):
     if dtype == "auto":
         model_dtype = "auto"
@@ -210,8 +211,9 @@ def load_model_and_tokenizer(
         device_map=device,
         torch_dtype=model_dtype,
         attn_implementation=attn_implementation,
+        cache_dir=cache_dir,
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, cache_dir=cache_dir)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -307,6 +309,7 @@ def main(args: argparse.Namespace):
         args.attn_implementation,
         args.to_bettertransformer,
         args.gradient_checkpointing,
+        args.model_cache_dir,
     )
 
     # Print info on model, tokenizer and dataset
@@ -783,6 +786,7 @@ def main(args: argparse.Namespace):
         args.attn_implementation,
         args.to_bettertransformer,
         args.gradient_checkpointing,
+        args.model_cache_dir,
     )
 
     with torch.no_grad():
@@ -908,6 +912,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--model_path", type=str, default=None, help="Path to the model"
+    )
+    parser.add_argument(
+        "--model_cache_dir", type=str, help="Directory to cache downloaded models to"
     )
     parser.add_argument(
         "--dictionary_path", type=str, default=None, help="Path to the dictionary file"
