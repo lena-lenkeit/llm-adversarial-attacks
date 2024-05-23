@@ -848,6 +848,7 @@ def main(args: argparse.Namespace):
         os.makedirs(f"{args.output_path}", exist_ok=True)
         with open(f"{args.output_path}/adversarial_tokens.json", mode="w") as f:
             data = {
+                "cmd_args": vars(args),
                 "roundtrip_adv_check": roundtrip_adv_check.tolist(),
                 "roundtrip_input_check": roundtrip_input_check.tolist(),
                 "roundtrip_full_check": roundtrip_full_check.tolist(),
