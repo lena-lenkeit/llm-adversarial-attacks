@@ -779,15 +779,16 @@ def main(args: argparse.Namespace):
         print(roundtrip_all_check)
 
     # Reload model and tokenizer
-    model, tokenizer = load_model_and_tokenizer(
-        args.model_path,
-        args.device,
-        args.dtype,
-        args.attn_implementation,
-        args.to_bettertransformer,
-        args.gradient_checkpointing,
-        args.model_cache_dir,
-    )
+    if not args.disable_reload:
+        model, tokenizer = load_model_and_tokenizer(
+            args.model_path,
+            args.device,
+            args.dtype,
+            args.attn_implementation,
+            args.to_bettertransformer,
+            args.gradient_checkpointing,
+            args.model_cache_dir,
+        )
 
     with torch.no_grad():
         # Get logits and hidden states for all tokens
@@ -958,6 +959,11 @@ if __name__ == "__main__":
         "--verbose",
         action="store_true",
         help="Print detailed model and tokenizer info, and found tokens",
+    )
+    parser.add_argument(
+        "--disable_reload",
+        action="store_true",
+        help="Prevent the model and tokenizer from being reloaded during validation",
     )
 
     parser.add_argument(
